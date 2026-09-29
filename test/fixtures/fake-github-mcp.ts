@@ -52,6 +52,26 @@ export function createFakeGitHubMcp() {
     }
   );
 
+  // A tool whose server already supports idempotency keys natively.
+  const nativeSeen = new Map<string, number>();
+  server.registerTool(
+    "create_ticket",
+    {
+      description: "Open a support ticket",
+      inputSchema: { title: z.string(), idempotency_key: z.string().optional() },
+      annotations: { readOnlyHint: false },
+    },
+    async ({ title, idempotency_key }) => {
+      if (idempotency_key && nativeSeen.has(idempotency_key)) {
+        return { content: [{ type: "text", text: `Ticket #${nativeSeen.get(idempotency_key)} (replayed)` }] };
+      }
+      const issue = { number: issues.length + 1, title, body: "", labels: [] };
+      issues.push(issue);
+      if (idempotency_key) nativeSeen.set(idempotency_key, issue.number);
+      return { content: [{ type: "text", text: `Ticket #${issue.number} key=${idempotency_key ?? "none"}` }] };
+    }
+  );
+
   // Test control; configure the proxy to pass it through.
   server.registerTool(
     "_fault",

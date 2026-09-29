@@ -59,6 +59,14 @@ export interface VerifiedMcpProxyOptions {
   store?: EffectStore;
   /** How the marker is written into the `marker` argument. Default "\n\n<!-- {marker} -->". */
   markerTemplate?: string;
+  /**
+   * Name of the optional idempotency-key argument added to every protected
+   * tool, or false to add none. Default "idempotency_key". When the agent
+   * passes one, it is the effect's identity: a retry with the same key never
+   * runs twice, even if the agent rewords the other arguments. The key is
+   * removed before forwarding, unless the server's own schema defines it.
+   */
+  idempotencyKeyParam?: string | false;
   onEscalate?: (ctx: EscalationContext<Args, CallToolResult>) => void | Promise<void>;
   trace?: (event: TraceEvent) => void;
 }
@@ -96,6 +104,13 @@ const fill = (template: Args | undefined, args: Args): Args =>
 
 const note = (text: string, isError = false): CallToolResult => ({ content: [{ type: "text", text }], isError });
 
+const ARGS_META = "verified-tool/args";
+
+const keyDescription = (param: string) =>
+  `Optional. A unique key you choose for this action, e.g. "refund-order-7". ` +
+  `If a call times out or its result is unclear, call again with the same ${param}: the action will not run twice, ` +
+  `and you will get its real result. Use a new key for a new action.`;
+
 /**
  * An MCP server that forwards to `upstream` and protects its write tools.
  * Read-only tools (readOnlyHint) pass through untouched. Every other tool
@@ -109,6 +124,7 @@ export function createVerifiedMcpProxy(upstream: Client, options: VerifiedMcpPro
   const timeout = options.timeoutMs ?? 60_000;
   const markerTemplate = options.markerTemplate ?? "\n\n<!-- {marker} -->";
   const markerFor = (key: string) => `verified-tool:${key}`;
+  const keyParam = options.idempotencyKeyParam === undefined ? "idempotency_key" : options.idempotencyKeyParam;
 
   let toolList: Promise<Tool[]> | undefined;
   const listAll = async () => {
@@ -121,12 +137,22 @@ export function createVerifiedMcpProxy(upstream: Client, options: VerifiedMcpPro
     } while (cursor);
     return tools;
   };
-  const annotationsOf = async (name: string) => (await (toolList ??= listAll())).find((t) => t.name === name)?.annotations;
+  const toolNamed = async (name: string) => (await (toolList ??= listAll())).find((t) => t.name === name);
+
+  const isProtected = (tool: Tool | undefined, name: string) => {
+    const configured = options.tools?.[name];
+    if (configured === "passthrough") return false;
+    if (configured) return true;
+    return !(tool?.annotations?.readOnlyHint || options.default === "passthrough");
+  };
+  const declaresKey = (tool: Tool | undefined) =>
+    !!keyParam && !!(tool?.inputSchema.properties as Args | undefined)?.[keyParam];
 
   const protectedTools = new Map<string, (args: Args) => Promise<CallToolResult>>();
 
-  function protect(name: string, policy: ProtectPolicy, idempotent: boolean) {
+  function protect(name: string, policy: ProtectPolicy, idempotent: boolean, nativeKey: boolean) {
     const errorResults = new WeakMap<Args, CallToolResult>();
+    const agentKeys = new WeakMap<Args, string>();
 
     const tool = defineTool<Args, CallToolResult>(
       async (args, ctx) => {
@@ -139,12 +165,15 @@ export function createVerifiedMcpProxy(upstream: Client, options: VerifiedMcpPro
           errorResults.set(args, result);
           throw new ToolErrorResult(result);
         }
-        return result;
+        // Remember what this effect was, so a reused key with different arguments can be refused.
+        return { ...result, _meta: { ...result._meta, [ARGS_META]: digest(args) } };
       },
       {
         name,
         store,
         effectKey: (args) => {
+          const agentKey = agentKeys.get(args);
+          if (agentKey) return `mcp:${name}:key:${digest(agentKey)}`;
           const picked = policy.effectKey ? Object.fromEntries(policy.effectKey.map((k) => [k, args[k]])) : args;
           return `mcp:${name}:${digest(picked)}`;
         },
@@ -175,21 +204,41 @@ export function createVerifiedMcpProxy(upstream: Client, options: VerifiedMcpPro
       }
     );
 
+    const clean = (r: CallToolResult | undefined): CallToolResult => {
+      if (!r?._meta || !(ARGS_META in r._meta)) return r ?? { content: [] };
+      const { [ARGS_META]: _, ...meta } = r._meta;
+      return { ...r, _meta: Object.keys(meta).length ? meta : undefined };
+    };
+
     return async (args: Args): Promise<CallToolResult> => {
-      const callArgs = { ...args };
+      const raw = keyParam ? args[keyParam] : undefined;
+      const agentKey = typeof raw === "string" && raw !== "" ? raw : undefined;
+      const callArgs: Args = { ...args };
+      if (keyParam && !nativeKey) delete callArgs[keyParam];
+      if (agentKey) agentKeys.set(callArgs, agentKey);
+
       const r: ToolCallResult<CallToolResult> = await tool(callArgs);
       switch (r.reason) {
         case "verified":
         case "trusted":
-          return r.result!;
-        case "cached":
+          return clean(r.result);
+        case "cached": {
+          const recorded = r.result?._meta?.[ARGS_META];
+          if (agentKey && recorded !== undefined && recorded !== digest(callArgs)) {
+            return note(
+              `${keyParam} "${agentKey}" was already used for a different ${name} request, so nothing was done. Use a new ${keyParam} for a new action.`,
+              true
+            );
+          }
+          const how = agentKey ? `with ${keyParam} "${agentKey}"` : "with these arguments";
           return {
-            ...r.result!,
+            ...clean(r.result),
             content: [
-              { type: "text", text: `${name} was already completed earlier with these arguments, so it was not repeated. The original result follows.` },
+              { type: "text", text: `${name} was already completed earlier ${how}, so it was not repeated. The original result follows.` },
               ...(r.result?.content ?? []),
             ],
           };
+        }
         case "failed":
         case "exhausted":
           return errorResults.get(callArgs) ?? note(describeOutcome(r, name), true);
@@ -200,25 +249,36 @@ export function createVerifiedMcpProxy(upstream: Client, options: VerifiedMcpPro
   }
 
   async function handlerFor(name: string) {
-    const configured = options.tools?.[name];
-    if (configured === "passthrough") return undefined;
-    const annotations = await annotationsOf(name);
-    if (!configured && (annotations?.readOnlyHint || options.default === "passthrough")) return undefined;
+    const tool = await toolNamed(name);
+    if (!isProtected(tool, name)) return undefined;
     let handler = protectedTools.get(name);
     if (!handler) {
-      const policy = configured ?? {};
-      handler = protect(name, policy, policy.idempotent ?? annotations?.idempotentHint === true);
+      const configured = options.tools?.[name];
+      const policy = configured && configured !== "passthrough" ? configured : {};
+      handler = protect(name, policy, policy.idempotent ?? tool?.annotations?.idempotentHint === true, declaresKey(tool));
       protectedTools.set(name, handler);
     }
     return handler;
   }
+
+  /** Offer an idempotency key on every protected tool that doesn't already have one. */
+  const withKeyParam = (tool: Tool): Tool => {
+    if (!keyParam || !isProtected(tool, tool.name) || declaresKey(tool)) return tool;
+    return {
+      ...tool,
+      inputSchema: {
+        ...tool.inputSchema,
+        properties: { ...tool.inputSchema.properties, [keyParam]: { type: "string", description: keyDescription(keyParam) } },
+      },
+    };
+  };
 
   const server = new Server({ name: "verified-tool-mcp-proxy", version: "0.3.0" }, { capabilities: { tools: {} } });
 
   server.setRequestHandler(ListToolsRequestSchema, async (request) => {
     const page = await upstream.listTools(request.params);
     toolList = undefined; // the tool set may have changed; re-read annotations lazily
-    return page;
+    return { ...page, tools: page.tools.map(withKeyParam) };
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {

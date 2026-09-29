@@ -126,10 +126,88 @@ describe("MCP proxy", () => {
     expect(text(retry)).toBe("Created issue #1");
   });
 
-  it("lists the upstream tools unchanged", async () => {
+  it("lists every upstream tool, offering idempotency_key only on write tools that don't already have one", async () => {
+    const { agent } = await setup({ tools: { _fault: "passthrough", _count: "passthrough" } });
+    const { tools } = await agent.listTools();
+    const hasKey = Object.fromEntries(tools.map((t) => [t.name, "idempotency_key" in (t.inputSchema.properties ?? {})]));
+
+    expect(Object.keys(hasKey).sort()).toEqual(["_count", "_fault", "add_label", "create_issue", "create_ticket", "list_issues"]);
+    expect(hasKey).toMatchObject({ create_issue: true, add_label: true, list_issues: false, _fault: false, _count: false });
+    const createIssue = tools.find((t) => t.name === "create_issue")!;
+    expect((createIssue.inputSchema.properties as any).idempotency_key.description).toMatch(/call again with the same idempotency_key/);
+    expect(createIssue.inputSchema.required).toEqual(["title", "body"]); // the key stays optional
+  });
+});
+
+describe("MCP proxy: idempotency keys", () => {
+  it("a retry with the same key after a timeout is blocked even when the agent rewords the arguments", async () => {
+    const { gh, agent } = await setup();
+    gh.faults.push("hang");
+
+    await agent.callTool({ name: "create_issue", arguments: { ...issue, idempotency_key: "inc-42" } });
+    const reworded = await agent.callTool({
+      name: "create_issue",
+      arguments: { title: "Checkout returning 500", body: "Rewritten by the model.", idempotency_key: "inc-42" },
+    });
+
+    expect(text(reworded)).toMatch(/Do not retry it/);
+    expect(gh.issues).toHaveLength(1);
+  });
+
+  it("without a key, the same reworded retry would be a second issue", async () => {
+    const { gh, agent } = await setup();
+    gh.faults.push("hang");
+
+    await agent.callTool({ name: "create_issue", arguments: issue });
+    await agent.callTool({ name: "create_issue", arguments: { title: "Checkout returning 500", body: "Rewritten by the model." } });
+
+    expect(gh.issues).toHaveLength(2);
+  });
+
+  it("the same key and arguments after success return the original result", async () => {
+    const { gh, agent } = await setup();
+    await agent.callTool({ name: "create_issue", arguments: { ...issue, idempotency_key: "k1" } });
+    const again = await agent.callTool({ name: "create_issue", arguments: { ...issue, idempotency_key: "k1" } });
+
+    expect(text(again)).toMatch(/already completed earlier with idempotency_key "k1"/);
+    expect(text(again)).toMatch(/Created issue #1/);
+    expect(again._meta?.["verified-tool/args"]).toBeUndefined();
+    expect(gh.issues).toHaveLength(1);
+  });
+
+  it("reusing a key for a different request is refused, like Stripe does", async () => {
+    const { gh, agent } = await setup();
+    await agent.callTool({ name: "create_issue", arguments: { ...issue, idempotency_key: "k1" } });
+    const misuse = await agent.callTool({ name: "create_issue", arguments: { title: "Unrelated", body: "x", idempotency_key: "k1" } });
+
+    expect(misuse.isError).toBe(true);
+    expect(text(misuse)).toMatch(/already used for a different create_issue request/);
+    expect(gh.issues).toHaveLength(1);
+  });
+
+  it("strips the key before forwarding to a server that doesn't know it", async () => {
+    const gh = createFakeGitHubMcp();
+    const upstream = await connect(gh.server);
+    const forwarded: unknown[] = [];
+    const callTool = upstream.callTool.bind(upstream);
+    upstream.callTool = ((params: { arguments?: unknown }, ...rest: never[]) => {
+      forwarded.push(params.arguments);
+      return callTool(params as never, ...rest);
+    }) as typeof upstream.callTool;
+    const agent = await connect(createVerifiedMcpProxy(upstream));
+
+    await agent.callTool({ name: "create_issue", arguments: { ...issue, idempotency_key: "k1" } });
+    expect(forwarded).toEqual([issue]);
+  });
+
+  it("forwards the key untouched to a server whose schema already defines it", async () => {
     const { agent } = await setup();
     const { tools } = await agent.listTools();
-    expect(tools.map((t) => t.name).sort()).toEqual(["_count", "_fault", "add_label", "create_issue", "list_issues"]);
+    const ticket = tools.find((t) => t.name === "create_ticket")!;
+
+    const r = await agent.callTool({ name: "create_ticket", arguments: { title: "Refund", idempotency_key: "t-1" } });
+    expect(text(r)).toBe("Ticket #1 key=t-1");
+    expect((ticket.inputSchema.properties as any).idempotency_key.description).toBeUndefined(); // the server's own definition, not ours
   });
 });
 
