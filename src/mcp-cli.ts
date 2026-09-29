@@ -43,3 +43,6 @@ const shutdown = async () => {
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 server.onclose = shutdown;
+// MCP clients end a stdio session by closing our stdin; exit (and stop the upstream server) when they do.
+process.stdin.on("end", shutdown);
+process.stdin.on("close", shutdown);

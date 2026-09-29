@@ -300,7 +300,9 @@ export function createVerifiedMcpProxy(upstream: Client, options: VerifiedMcpPro
           const retry = keyParam
             ? ` If you confirm it did NOT take effect, you may call ${name} again with a new ${keyParam}. If it did, don't repeat it.`
             : "";
-          return note(text + retry, true);
+          // Keep what the server actually said (e.g. "timed out after 30s") after our note.
+          const original = errorResults.get(callArgs)?.content ?? [];
+          return { content: [{ type: "text", text: text + retry }, ...original], isError: true };
         }
         default:
           return note(describeOutcome({ ...r, result: undefined }, name), r.outcome !== "verified");

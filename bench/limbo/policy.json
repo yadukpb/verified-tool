@@ -1,0 +1,11 @@
+{
+  "notExecutedErrors": [
+    "\"status\": (4\\d\\d|503)",
+    "\"type\": \"(tool_error|invalid_arguments)\""
+  ],
+  "tools": {
+    "wait": "passthrough",
+    "finish": "passthrough",
+    "escalate_to_human": "passthrough"
+  }
+}
