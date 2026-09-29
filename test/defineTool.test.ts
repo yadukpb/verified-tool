@@ -366,11 +366,22 @@ describe("verification", () => {
     expect(r).toMatchObject({ ok: false, outcome: "failed", reason: "failed", executions: 1 });
   });
 
-  it("still pending after polling: unknown, escalated", async () => {
+  it("still pending after polling: unknown, and escalated to whoever onEscalate notifies", async () => {
     const stripe = new FakeStripe();
-    const r = await makeChargeTool(stripe, { poll: { attempts: 2, delayMs: 10 } })({ ...order, settleMs: 5_000 });
+    const onEscalate = vi.fn();
+    const r = await makeChargeTool(stripe, { poll: { attempts: 2, delayMs: 10 }, onEscalate })({ ...order, settleMs: 5_000 });
 
     expect(r).toMatchObject({ ok: false, outcome: "unknown", reason: "ambiguous", escalated: true });
+    expect(onEscalate).toHaveBeenCalledOnce();
+  });
+
+  it("without an onEscalate handler, nobody is asked, so the model isn't told anyone was", async () => {
+    const stripe = new FakeStripe();
+    const r = await makeChargeTool(stripe, { poll: { attempts: 1 } })({ ...order, settleMs: 5_000 });
+
+    expect(r).toMatchObject({ outcome: "unknown", reason: "ambiguous", escalated: false });
+    expect(describeOutcome(r, "charge_card")).not.toMatch(/person has been asked/);
+    expect(describeOutcome(r, "charge_card")).toMatch(/report the outcome as uncertain/);
   });
 
   it("with onUnknown: 'proceed', an unresolved outcome is ok but still reported as unknown", async () => {

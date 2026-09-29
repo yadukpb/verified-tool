@@ -29,8 +29,9 @@ await upstream.connect(
 
 const server = createVerifiedMcpProxy(upstream, {
   ...config,
-  onEscalate: (ctx) => {
-    log(`outcome unknown for ${ctx.toolName} ${JSON.stringify(ctx.args)}; not retried`);
+  // A log line isn't a person, so this is a trace, not onEscalate: the model is never told someone was asked.
+  trace: (e) => {
+    if (e.type === "settled" && e.reason === "ambiguous") log(`outcome unknown for ${e.tool}; blocked from repeating`);
   },
 });
 await server.connect(new StdioServerTransport());

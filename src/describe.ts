@@ -32,7 +32,7 @@ export function describeOutcome(r: ToolCallResult<unknown>, toolName = "The acti
         `It is not known whether ${toolName} took effect. Do not retry it, and do not tell the user it succeeded or failed. ` +
         (r.escalated
           ? "A person has been asked to confirm; tell the user it is pending confirmation."
-          : "Tell the user the result is pending confirmation.")
+          : "Check another way if you can (for example with a tool that reads or lists what exists), or report the outcome as uncertain.")
       );
   }
 }

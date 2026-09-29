@@ -150,7 +150,8 @@ export function defineTool<TArgs, TResult>(
       }
 
       let escalated = false;
-      if (reason === "ambiguous" && onUnknown === "escalate" && escalate) {
+      // "escalated" tells the model a person was asked, so only claim it when someone actually was.
+      if (reason === "ambiguous" && onUnknown === "escalate" && escalate && onEscalate) {
         escalated = true;
         emit({ type: "escalate", reason });
         try {

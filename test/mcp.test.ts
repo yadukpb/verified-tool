@@ -139,6 +139,33 @@ describe("MCP proxy", () => {
   });
 });
 
+describe("MCP proxy: reading error results", () => {
+  it("errors matching notExecutedErrors are returned as-is and don't block a retry", async () => {
+    const { gh, agent } = await setup({ notExecutedErrors: ["^422:"] });
+    gh.faults.push("reject");
+
+    const first = await agent.callTool({ name: "create_issue", arguments: issue });
+    const retry = await agent.callTool({ name: "create_issue", arguments: issue });
+
+    expect(text(first)).toBe("422: title is too long");
+    expect(text(retry)).toBe("Created issue #1");
+  });
+
+  it("errors that don't match are ambiguous: blocked, with a way out once the agent has checked", async () => {
+    const { gh, agent } = await setup({ notExecutedErrors: ["^429"] });
+    gh.faults.push("reject");
+
+    await agent.callTool({ name: "create_issue", arguments: issue });
+    const retry = await agent.callTool({ name: "create_issue", arguments: issue });
+    const afterChecking = await agent.callTool({ name: "create_issue", arguments: { ...issue, idempotency_key: "retry-1" } });
+
+    expect(text(retry)).toMatch(/Do not retry it/);
+    expect(text(retry)).toMatch(/If you confirm it did NOT take effect, you may call create_issue again with a new idempotency_key/);
+    expect(text(retry)).not.toMatch(/person has been asked/);
+    expect(text(afterChecking)).toBe("Created issue #1");
+  });
+});
+
 describe("MCP proxy: requests still in flight", () => {
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 

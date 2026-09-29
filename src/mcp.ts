@@ -40,6 +40,8 @@ export interface ProtectPolicy {
   idempotent?: boolean;
   /** How long a request to this tool can stay in flight; see DefineToolOptions.maxInFlightMs. Unset: "not found" is never trusted. */
   maxInFlightMs?: number;
+  /** Adds to the proxy-wide `notExecutedErrors` for this tool. */
+  notExecutedErrors?: string[];
 }
 
 export type ToolPolicy = "passthrough" | ProtectPolicy;
@@ -79,6 +81,14 @@ export interface VerifiedMcpProxyOptions {
    * removed before forwarding, unless the server's own schema defines it.
    */
   idempotencyKeyParam?: string | false;
+  /**
+   * Regular expressions matched against the text of an isError result. A
+   * match means the server rejected the request without acting on it (a
+   * validation error, 429, 503), so the error is returned as-is and the
+   * agent may retry. Anything that doesn't match is treated as ambiguous.
+   * Example: ["\"status\": (4\\d\\d|503)"].
+   */
+  notExecutedErrors?: string[];
   onEscalate?: (ctx: EscalationContext<Args, CallToolResult>) => void | Promise<void>;
   trace?: (event: TraceEvent) => void;
 }
@@ -166,6 +176,7 @@ export function createVerifiedMcpProxy(upstream: Client, options: VerifiedMcpPro
   function protect(name: string, policy: ProtectPolicy, idempotent: boolean, nativeKey: boolean) {
     const errorResults = new WeakMap<Args, CallToolResult>();
     const agentKeys = new WeakMap<Args, string>();
+    const notExecuted = [...(options.notExecutedErrors ?? []), ...(policy.notExecutedErrors ?? [])].map((p) => new RegExp(p));
 
     const tool = defineTool<Args, CallToolResult>(
       async (args, ctx) => {
@@ -191,7 +202,11 @@ export function createVerifiedMcpProxy(upstream: Client, options: VerifiedMcpPro
           return `mcp:${name}:${digest(picked)}`;
         },
         classifyError: (error) => {
-          if (error instanceof ToolErrorResult) return policy.errorResults === "failed" ? "not_executed" : "ambiguous";
+          if (error instanceof ToolErrorResult) {
+            if (policy.errorResults === "failed") return "not_executed";
+            const text = textOf(error.result);
+            return notExecuted.some((re) => re.test(text)) ? "not_executed" : "ambiguous";
+          }
           if (error instanceof McpError && REJECTED_BEFORE_RUNNING.has(error.code)) return "not_executed";
           return "ambiguous";
         },
@@ -279,6 +294,14 @@ export function createVerifiedMcpProxy(upstream: Client, options: VerifiedMcpPro
         case "failed":
         case "exhausted":
           return errorResults.get(callArgs) ?? note(describeOutcome(r, name), true);
+        case "ambiguous": {
+          const text = describeOutcome({ ...r, result: undefined }, name);
+          // Without this, an agent that checked and found nothing could never finish the task.
+          const retry = keyParam
+            ? ` If you confirm it did NOT take effect, you may call ${name} again with a new ${keyParam}. If it did, don't repeat it.`
+            : "";
+          return note(text + retry, true);
+        }
         default:
           return note(describeOutcome({ ...r, result: undefined }, name), r.outcome !== "verified");
       }
