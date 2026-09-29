@@ -1,113 +1,179 @@
 # verified-tool
 
-**Stop your AI agent from believing a tool call succeeded when it didn't.**
+**Stop your AI agent from double-charging, double-sending, or claiming success it can't confirm.**
 
-A small TypeScript wrapper around any async tool function. It doesn't trust the return value — it makes you (optionally) confirm the side effect actually happened, and it's honest about the case where you can't tell yet.
+A small TypeScript wrapper for side-effecting agent tools (payments, emails, tickets, writes). It is framework-agnostic and has no runtime dependencies. After a request may have reached the outside world, it learns more only by *reading* the outside world, never by blindly doing the action again.
 
 ```bash
-npm install verified-tool
+git clone https://github.com/yadukpb/verified-tool && cd verified-tool && npm install
+npm run demo          # lost response → naive retry double-charges; this doesn't
+npm run demo:crash    # kill -9 right after the charge, restart, recover with no second charge
 ```
 
-## The problem
+**Try it in the browser:** [interactive demo](https://claude.ai/artifact/Gz7cqZxeq36ZoEfkhaVyBs)
 
-Tool-calling agents report success the instant a call returns without an exception. In production that's wrong often enough to matter: the email API accepted the request but the message later bounced; the payment gateway returned `200` but the charge is still pending or gets declined seconds later; the write hit a replica that hasn't caught up yet. The agent tells the user "done" before reality has settled.
+## The failure this is built around
 
-This is a named, current failure mode, not a hypothetical:
+From [langchain-ai/langgraph#8464](https://github.com/langchain-ai/langgraph/issues/8464), reproduced against Stripe test mode:
 
-- ["From Confident Closing to Silent Failure: Characterizing False Success in LLM Agents"](https://arxiv.org/html/2606.09863) — agents that report task completion without confirming the underlying state actually changed.
-- ["Verified Tool Calls Improve LLM Agent Reliability Under Non-Atomic Failures"](https://arxiv.org/pdf/2608.02645) — same problem, from the reliability-engineering side.
-- [LangGraph issue #8464](https://github.com/langchain-ai/langgraph/issues/8464) — durable tool execution idempotency & retry, open and unresolved.
-- [Vercel AI SDK issue #14649](https://github.com/vercel/ai/issues/14649) — a governance/verification hook, requested, unshipped.
-- The [Claude Agent SDK docs](https://docs.claude.com) tell you to build this yourself — there's no built-in retry, idempotency, or outcome verification in `tool_runner`.
+```
+agent:     charge_card(customer="Anil", order_id="o988", amount_gbp=12.0)
+stripe:    PaymentIntent #1 succeeded
+tool:      raises APIConnectionError (response lost)
+langgraph: RetryPolicy re-runs the tools node
+stripe:    PaymentIntent #2 succeeded, 1s later
+agent:     "Charged 12.00 GBP to customer Anil for order o988 successfully."
 
-Nobody has shipped a small, framework-agnostic primitive for this. That's what this is.
+expected: 1 charge    actual: 2 charges    agent's report: success
+```
 
-## Quickstart
+The reporter measured this across 5 runs per setup. The default retry policy double-charged 5/5 times. Turning off retries and letting the model handle the error also double-charged 5/5, because **the model re-sent the call itself**, checking first only once in 30 fault runs. Only an idempotency key derived from the business object (not the model's `tool_call_id`, which changes when the model re-plans) prevented it.
+
+A timeout is not a failure. It means *we don't know*. The same thread identifies the rest of what a fix needs: a durable claim before executing, a `reconcile()` read of the external system before any retry, and a fresh authorization check before re-executing after recovery. This library implements those.
+
+## How it decides what to do
+
+```
+call(args)
+ ├─ effect key already settled?                 → return cached result, execute nothing
+ ├─ someone else holds a live claim?            → "in_flight", execute nothing
+ ├─ claim expired (a previous run crashed)?     → reconcile() first
+ └─ authorize() → execute once
+      ├─ returned      → verify() (polled while pending)   → verified | failed | unknown
+      ├─ threw, "not_executed" (e.g. 429)  → safe to execute again (up to maxExecutions)
+      └─ threw, "ambiguous" (e.g. timeout) → reconcile() → found it: verified
+                                                          → proved absent: execute again
+                                                          → can't tell: unknown, escalate
+```
+
+Every error defaults to **ambiguous**. You opt specific errors into "safe to retry"; you never have to remember to opt them out.
+
+## Usage
 
 ```ts
-import { defineTool } from "verified-tool";
+import { defineTool, describeOutcome } from "verified-tool";
 
-const sendPayment = defineTool(dispatchPayment, {
-  name: "sendPayment",
-  idempotencyKey: (args) => args.orderId,
-  policy: { unknown: "retry", failed: "throw" },
-  verify: async (result) => {
-    const status = await getPaymentStatus(result.transactionId);
-    if (status === "succeeded") return "verified";
-    if (status === "declined") return "failed";
-    return "unknown"; // still settling — we honestly don't know yet
-  },
+const chargeCard = defineTool(
+  // ctx.effectKey is forwarded as Stripe's Idempotency-Key, so the provider dedupes too
+  (args: { orderId: string; amountCents: number }, ctx) =>
+    stripe.paymentIntents.create(
+      { amount: args.amountCents, currency: "gbp", metadata: { order_id: args.orderId } },
+      { idempotencyKey: ctx.effectKey }
+    ),
+  {
+    name: "charge_card",
+    effectKey: (args) => `charge:${args.orderId}`,        // business identity, not tool_call_id
+    classifyError: (e) => (e instanceof Stripe.errors.StripeRateLimitError ? "not_executed" : "ambiguous"),
+    verify: async (pi) => {
+      const fresh = await stripe.paymentIntents.retrieve(pi.id);
+      const outcome =
+        fresh.status === "succeeded" ? "verified"
+        : ["canceled", "requires_payment_method"].includes(fresh.status) ? "failed"
+        : "unknown";
+      return { outcome, result: fresh };
+    },
+    reconcile: async ({ args }) => {
+      // look it up without the lost response
+      const found = await findPaymentIntentByOrder(args.orderId);
+      if (!found) return { outcome: "failed" };            // proved it never happened → safe to execute
+      return { outcome: found.status === "succeeded" ? "verified" : "unknown", result: found };
+    },
+    authorize: async ({ args }) => budgets.canCharge(args.orderId),  // re-checked on every real execution
+    store: myPostgresEffectStore,                           // see "Stores" below
+    onEscalate: (ctx) => pageOnCall(ctx),
+  }
+);
+```
+
+### Giving the result to the model
+
+What the model reads decides whether it retries or tells the user something false. `describeOutcome()` turns a result into explicit instructions:
+
+| reason | the model reads |
+|---|---|
+| `verified` | charge_card succeeded and the result was confirmed. |
+| `reconciled` | charge_card succeeded. The first response was lost, but the result was confirmed by checking the system directly. Do not repeat it. |
+| `cached` | charge_card had already been completed earlier, so it was not repeated. |
+| `in_flight` | charge_card for this item is already in progress. Do not call it again. |
+| `ambiguous` | It is not known whether charge_card took effect. Do not retry it, and do not tell the user it succeeded or failed. A person has been asked to confirm… |
+
+With the Vercel AI SDK:
+
+```ts
+import { tool } from "ai";
+
+export const chargeCardTool = tool({
+  description: "Charge the customer's card for an order",
+  inputSchema: z.object({ orderId: z.string(), amountCents: z.number().int() }),
+  execute: async (args) => describeOutcome(await chargeCard(args), "charge_card"),
 });
-
-const outcome = await sendPayment({ orderId: "order-42", amountCents: 5000 });
-// outcome.outcome is "verified" | "failed" | "unknown" — never a guess
 ```
 
-## Why three states, not a boolean
+The same pattern works in any framework where a tool is an async function returning a string: the OpenAI Agents SDK, LangGraph.js, Mastra, or a hand-rolled loop on the Claude API.
 
-A boolean `verify()` forces you to guess the instant the true state is ambiguous — which is exactly how "false success" happens in the first place. Most real integrations have a window where you genuinely don't know yet: a webhook hasn't fired, a replica hasn't caught up, a queue hasn't drained. `"unknown"` gives that window somewhere honest to go, instead of silently collapsing into `true`.
+## Outcomes
 
-```
-verified → proceed, tell the agent it worked
-failed   → retry, then throw (or escalate) once retries are exhausted
-unknown  → your call: retry / escalate to a human / proceed anyway
-```
+Every call returns `{ ok, outcome, reason, result, executions, escalated, effectKey }`. `executions` is the number of times your function actually ran, which is the number to watch.
 
-The default policy escalates on `unknown` rather than assuming success. That's a deliberate, conservative default — flip it with `policy: { unknown: "proceed" }` if your use case can tolerate optimism.
+| outcome | reasons | meaning |
+|---|---|---|
+| `verified` | `verified`, `reconciled`, `cached`, `trusted` | It happened. `trusted` means no `verify()` was configured, so it was taken at face value. |
+| `failed` | `failed`, `exhausted`, `denied` | It confirmably did not happen. The claim is released so a later call may try again. |
+| `unknown` | `ambiguous`, `in_flight` | We don't know yet. The effect is marked **unresolved**, so nothing re-executes. The next call with the same key re-checks with `reconcile()` (without paging anyone again), or a person settles it with `resolveEffect()`. |
 
-## Run the demo
+## Stores
 
-```bash
-git clone <this repo>
-cd verified-tool
-npm install
-npm run demo
-```
+The effect store holds claims and settled results by effect key. Each claim carries a random owner token. Taking over, settling, and releasing are compare-and-swap operations on that token, so when two callers race for an expired claim, exactly one wins. A run that lost its claim can't overwrite or release it.
 
-The demo simulates a payment gateway with **real async settlement lag** (not a fake coinflip) — a charge dispatches instantly but the ledger only reflects the true outcome after a delay, exactly like querying Stripe right after a charge. It runs the naive version first (which confidently reports success on a payment that's about to be declined) next to the verified version (which retries through the ambiguous window and correctly refuses to lie).
+- `createMemoryStore()` is the default. It's fine for a single process, but it can't recover a crash.
+- `createFileStore(dir)` (from `verified-tool/file-store`, Node only) survives `kill -9` on one machine. It's what `npm run demo:crash` uses.
+- For multiple instances, implement the four-method `EffectStore` interface. In Postgres, `claim` is `INSERT … ON CONFLICT DO NOTHING`, and `replace`/`release` are `UPDATE`/`DELETE … WHERE owner = $expected`. In Redis, `claim` is `SET NX`, and the other two are a small compare-and-set Lua script.
 
-## API
+The owner renews its lease before every execution and every verify/reconcile poll. A claim left unrenewed for `leaseMs` (default 30s) is presumed to belong to a crashed run and gets reconciled. So `leaseMs` only has to outlast **one** execution of your tool or one poll, not the whole call.
+
+### Settling by hand
+
+After an `unknown` outcome escalates, the person who checks it records the answer:
 
 ```ts
-defineTool(fn, {
-  name: string,
-  schema?: { parse(input: unknown): TResult },   // duck-typed to accept a Zod schema directly
-  verify?: (result, args) => Promise<"verified" | "failed" | "unknown">,
-  idempotencyKey?: (args) => string,
-  idempotencyStore?: IdempotencyStore,            // defaults to an in-memory Map — swap in Redis/Postgres for anything that needs to survive a restart
-  policy?: { unknown?: "escalate" | "retry" | "proceed", failed?: "retry" | "throw" | "escalate" },
-  maxRetries?: number,                            // default 2
-  onEscalate?: (ctx) => void | Promise<void>,
-  trace?: (event) => void,                        // structured events for every attempt — pipe to whatever logging you already have
-})
+import { resolveEffect } from "verified-tool";
+await resolveEffect(store, "charge:o988", "verified", { id: "pi_123" }); // later calls return it as cached
+await resolveEffect(store, "charge:o988", "failed");                     // clears it; a later call may execute
 ```
 
-Returns `(args) => Promise<{ ok, outcome, result, attempts, escalated, idempotencyKey }>`.
+## What this does not do
 
-## What this is not
+- **It doesn't write your `verify()` or `reconcile()`.** They're specific to each tool. Some systems (fire-and-forget webhooks, legacy RPC with no read API) give you no way to check. Then the honest answer is `unknown`, and the library escalates rather than guessing.
+- **It can't make a non-idempotent API idempotent.** The claim store stops *this wrapper* from re-executing. If the downstream doesn't honor an idempotency key, a request that was in flight when a process died can still have landed. That's exactly why recovery reconciles before acting.
+- **It isn't durable execution.** It doesn't resume your agent's workflow after a crash. It makes each side effect safe to call again. Use [Temporal](https://temporal.io) or [Restate](https://restate.dev) for durable workflows. The two approaches compose.
+- **It needs an honest `reconcile()`.** Returning `failed` from reconcile triggers another execution, so it must mean "proven absent", read from a source that sees its own writes. An eventually consistent search index (Stripe's `charges.search`, for one) can miss a charge made a second ago. Return `unknown` if the lookup might be lagging.
+- **A single execution longer than `leaseMs` looks like a crash.** Another caller can then take over and reconcile while the first run is still inside your function. Size the lease above your tool's worst-case latency.
+- **It doesn't cap how many times a run calls a tool.** Loop and budget limits are a separate concern.
 
-- **Not durable execution.** It doesn't survive a process crash mid-call. For that, use [Restate](https://restate.dev) or [Temporal](https://temporal.io) — different, harder problem, already solved well by funded infra.
-- **Not automatic verification.** `verify()` is yours to write. For webhook-only services with no read-back endpoint, the honest answer is `"unknown"` on essentially every call — that's not a bug, it's the library refusing to fake certainty it doesn't have. See [Limitations](#limitations).
-- **Not an idempotency guarantee on its own.** The idempotency key only prevents duplicate side effects if the *downstream* system honors it (Stripe does; a lot of internal/legacy APIs don't). This library can't retrofit idempotency onto an API that doesn't support it.
+## Prior art
 
-## Limitations
+| | verified-tool | Temporal / Restate | kiri-gate | reality-ontology-runtime | idempotency-key libs |
+|---|---|---|---|---|---|
+| Language | TypeScript | many | Python | Python | many |
+| Reconcile before retrying an ambiguous error | yes | you write it in the activity | reversibility gate | yes | no |
+| Claim + lease crash recovery | yes | yes (full workflow replay) | — | yes (event-sourced) | no |
+| Three-state outcome given to the model | yes | no | — | — | no |
+| Drop-in around one function | yes | no, adopt the runtime | yes | no | yes |
 
-Being direct about this rather than letting you find out the hard way:
+[kiri-gate](https://github.com/aryan597/kiri-gate) and [reality-ontology-runtime](https://github.com/leadingproblemsolver/reality-ontology-runtime) come from the authors of the reproductions in LangGraph #8464 and are worth reading. Before this, I couldn't find a TypeScript equivalent.
 
-1. **`verify()` is bespoke per tool, always.** This library gives you the type, the retry/escalation policy, and a place to put the check — it does not generate the check. For a real chunk of integrations (fire-and-forget webhooks, some legacy RPC) there is no independent way to confirm state, and `verify()` is honestly unwritable, not just hard.
-2. **Idempotency needs a cooperative downstream.** If the API you're calling doesn't support an idempotency key itself, retries can still double-fire the underlying side effect even with this wrapper in front of it.
-3. **This solves a different problem than durable execution frameworks.** If your primary risk is the process crashing mid-run, you want Restate/Temporal, not this.
+## Background reading
 
-## Prior art / how this differs
+- [Characterizing False Success in LLM Agents](https://arxiv.org/abs/2606.09863) (arXiv 2606.09863)
+- [Verified Tool Calls Improve LLM Agent Reliability Under Non-Atomic Failures](https://arxiv.org/abs/2608.02645) (arXiv 2608.02645)
+- [langchain-ai/langgraph#8464](https://github.com/langchain-ai/langgraph/issues/8464): the discussion this design follows
 
-| | verified-tool | Temporal / Restate | idempotency-only libs | getmarrow.ai |
-|---|---|---|---|---|
-| Postcondition verification (3-state) | ✅ | ❌ | ❌ | binary `committed` proof |
-| Idempotency keys | ✅ (bring your own store) | ✅ | ✅ | — |
-| Survives process crash | ❌ | ✅ | ❌ | — |
-| Drop-in on an existing function | ✅ | ❌ (adopt workflow model) | ✅ | ❌ (hosted governance layer) |
-| Framework requirement | none | Temporal/Restate runtime | none | Marrow platform |
+## Development
 
-## License
+```bash
+npm test            # 28 tests: lost responses, SIGKILL crash recovery, claim races, lease renewal, throwing hooks
+npm run typecheck
+npm run build
+```
 
 MIT

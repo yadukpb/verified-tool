@@ -1,7 +1,7 @@
 {
   "name": "verified-tool",
-  "version": "0.1.0",
-  "description": "Stop your AI agent from believing a tool call succeeded when it didn't. A drop-in wrapper that verifies tool-call outcomes (verified/failed/unknown) instead of trusting the return value.",
+  "version": "0.2.0",
+  "description": "Stop AI agents from double-charging, double-sending, or claiming success they can't confirm. Reconcile-before-retry, crash-safe effect keys, and three-state outcomes for agent tool calls.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -9,15 +9,22 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./file-store": {
+      "types": "./dist/file-store.d.ts",
+      "import": "./dist/file-store.js"
     }
   },
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "tsup src/index.ts --format esm --dts",
+    "build": "tsup src/index.ts src/file-store.ts --format esm --dts",
     "test": "vitest run",
-    "demo": "tsx examples/payment-demo.ts"
+    "typecheck": "tsc --noEmit -p . && tsc --noEmit --strict --module ESNext --moduleResolution Bundler --target ES2022 --skipLibCheck --types node examples/*.ts test/*.ts",
+    "demo": "tsx examples/double-charge-demo.ts",
+    "demo:crash": "tsx examples/crash-demo.ts",
+    "demo:settlement": "tsx examples/settlement-demo.ts"
   },
   "keywords": [
     "ai-agent",
@@ -30,9 +37,13 @@
   "license": "MIT",
   "author": "yadukpb",
   "devDependencies": {
+    "@types/node": "^22.20.4",
     "tsup": "^8.3.5",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "^5.0.2"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }

@@ -1,16 +1,18 @@
 export { defineTool } from "./defineTool.js";
-export { createMemoryIdempotencyStore } from "./idempotency.js";
+export { describeOutcome } from "./describe.js";
+export { createMemoryStore, resolveEffect } from "./stores.js";
 export type {
   VerifyOutcome,
+  ErrorClass,
+  Reason,
   Parser,
-  IdempotencyStore,
-  StoredCall,
-  UnknownPolicy,
-  FailedPolicy,
-  Policy,
+  EffectRecord,
+  EffectStore,
+  ToolContext,
+  ReconcileResult,
   EscalationContext,
   TraceEvent,
+  PollOptions,
   DefineToolOptions,
   ToolCallResult,
 } from "./types.js";
-export { EscalatedError, ToolFailedError } from "./types.js";
