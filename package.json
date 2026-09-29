@@ -1,6 +1,6 @@
 {
   "name": "verified-tool",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Stop AI agents from repeating side effects (double charges, duplicate tickets, duplicate emails) or claiming success they can't confirm. Reconcile-before-retry, crash-safe effect keys, three-state outcomes.",
   "keywords": [
     "ai-agent",
@@ -37,7 +37,18 @@
     "./file-store": {
       "types": "./dist/file-store.d.ts",
       "import": "./dist/file-store.js"
+    },
+    "./ai-sdk": {
+      "types": "./dist/ai-sdk.d.ts",
+      "import": "./dist/ai-sdk.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp.d.ts",
+      "import": "./dist/mcp.js"
     }
+  },
+  "bin": {
+    "verified-tool-mcp": "./dist/mcp-cli.js"
   },
   "files": [
     "dist"
@@ -47,7 +58,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsup src/index.ts src/file-store.ts --format esm --dts --clean",
+    "build": "tsup src/index.ts src/file-store.ts src/ai-sdk.ts src/mcp.ts src/mcp-cli.ts --format esm --dts --clean --external @modelcontextprotocol/sdk",
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p . && tsc --noEmit --strict --module ESNext --moduleResolution Bundler --target ES2022 --skipLibCheck --types node examples/*.ts test/*.ts",
     "demo": "tsx examples/double-charge-demo.ts",
@@ -57,6 +68,14 @@
     "demo:email": "tsx examples/email-demo.ts",
     "prepublishOnly": "npm run typecheck && npm test && npm run build",
     "test:db": "PG_URL=postgres://postgres:vt@localhost:55432/vt REDIS_URL=redis://localhost:56379 vitest run"
+  },
+  "peerDependencies": {
+    "@modelcontextprotocol/sdk": "^1.20.0"
+  },
+  "peerDependenciesMeta": {
+    "@modelcontextprotocol/sdk": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.31.0",

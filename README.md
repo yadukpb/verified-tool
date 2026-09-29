@@ -43,13 +43,13 @@ Payments are the example because the evidence is a real double charge, but nothi
 
 ## Three kinds of side effect
 
-What you can do after a lost response depends on what the other system lets you ask. There are three cases, and each has a runnable example:
+What you can do after a lost response depends on what the other system lets you ask. There are three cases. Each has a built-in recipe, so you configure it instead of writing it, and a runnable example:
 
-| The system… | Examples | How you find out what happened | Example |
+| The system… | Examples | Recipe | Example |
 |---|---|---|---|
-| **accepts an idempotency key and lets you read by it** | Stripe, Adyen, many modern payment and banking APIs | Forward `ctx.effectKey` as the idempotency key. `verify()` reads the object and `reconcile()` looks it up. | [`charge-tool.ts`](examples/charge-tool.ts) |
-| **has no idempotency key, but lets you list what exists** | GitHub/Jira issues, Slack messages, calendar events, your own database | Write the effect key *into* what you create (a hidden marker, a unique column). `reconcile()` lists recent items and looks for it. | [`issue-tool.ts`](examples/issue-tool.ts) |
-| **can't be asked at all, only reports back later** | Email, SMS, push, outbound webhooks | Don't write a `reconcile()`; there's no honest one. A lost response ends `unknown` and stays blocked. The provider's webhook calls `resolveEffect()` when the delivered/bounced event arrives. | [`email-tool.ts`](examples/email-tool.ts) |
+| **accepts an idempotency key** | Stripe, Adyen, many modern payment and banking APIs | `downstreamIdempotent: true` forwards `ctx.effectKey` as the key, so retrying after a timeout is safe. `statusCheck()` maps the object's status to verified/failed/pending. | [`charge-tool.ts`](examples/charge-tool.ts) |
+| **has no idempotency key, but lets you list what exists** | GitHub/Jira issues, Slack messages, calendar events, your own database | `markerRecipe()` writes the effect key *into* what you create (a hidden marker, a unique column), and its `reconcile` lists recent items to find it. | [`issue-tool.ts`](examples/issue-tool.ts) |
+| **can't be asked at all, only reports back later** | Email, SMS, push, outbound webhooks | No `reconcile()`, since there's no honest one. A lost response ends `unknown` and stays blocked. `settleOnEvent()` turns the provider's delivered/bounced webhook into a settled effect. | [`email-tool.ts`](examples/email-tool.ts) |
 
 The third row is the one most wrappers get wrong. They either retry (duplicate email) or report success (the agent says "sent" when it doesn't know). Here, the model is told the result is pending, a person is paged, and the webhook settles it:
 
@@ -84,10 +84,10 @@ Every error defaults to **ambiguous**. You opt specific errors into "safe to ret
 ## Usage
 
 ```ts
-import { defineTool, describeOutcome } from "verified-tool";
+import { defineTool, statusCheck, createPostgresStore } from "verified-tool";
 
 const chargeCard = defineTool(
-  // ctx.effectKey is forwarded as Stripe's Idempotency-Key, so the provider dedupes too
+  // ctx.effectKey is forwarded as Stripe's Idempotency-Key, so Stripe dedupes retries too
   (args: { orderId: string; amountCents: number }, ctx) =>
     stripe.paymentIntents.create(
       { amount: args.amountCents, currency: "gbp", metadata: { order_id: args.orderId } },
@@ -96,27 +96,20 @@ const chargeCard = defineTool(
   {
     name: "charge_card",
     effectKey: (args) => `charge:${args.orderId}`,        // business identity, not tool_call_id
+    downstreamIdempotent: true,                             // Stripe honors the key, so a retry after a timeout is safe
     classifyError: (e) => (e instanceof Stripe.errors.StripeRateLimitError ? "not_executed" : "ambiguous"),
-    verify: async (pi) => {
-      const fresh = await stripe.paymentIntents.retrieve(pi.id);
-      const outcome =
-        fresh.status === "succeeded" ? "verified"
-        : ["canceled", "requires_payment_method"].includes(fresh.status) ? "failed"
-        : "unknown";
-      return { outcome, result: fresh };
-    },
-    reconcile: async ({ args }) => {
-      // look it up without the lost response
-      const found = await findPaymentIntentByOrder(args.orderId);
-      if (!found) return { outcome: "failed" };            // proved it never happened → safe to execute
-      return { outcome: found.status === "succeeded" ? "verified" : "unknown", result: found };
-    },
+    verify: statusCheck((pi) => stripe.paymentIntents.retrieve(pi.id), (pi) => pi.status, {
+      verified: ["succeeded"],
+      failed: ["canceled", "requires_payment_method"],
+    }),
     authorize: async ({ args }) => budgets.canCharge(args.orderId),  // re-checked on every real execution
-    store: myPostgresEffectStore,                           // see "Stores" below
+    store: createPostgresStore(pool),                       // see "Stores" below
     onEscalate: (ctx) => pageOnCall(ctx),
   }
 );
 ```
+
+For a system without idempotency keys, add a `reconcile()` that looks the effect up without the lost response. See [`markerRecipe`](examples/issue-tool.ts).
 
 ### Giving the result to the model
 
@@ -130,19 +123,71 @@ What the model reads decides whether it retries or tells the user something fals
 | `in_flight` | charge_card for this item is already in progress. Do not call it again. |
 | `ambiguous` | It is not known whether charge_card took effect. Do not retry it, and do not tell the user it succeeded or failed. A person has been asked to confirm… |
 
-With the Vercel AI SDK:
+In any framework where a tool is an async function, return `describeOutcome(await chargeCard(args), "charge_card")` from it. That covers the OpenAI Agents SDK, LangGraph.js, Mastra, and a hand-rolled loop on the Claude API.
+
+### Vercel AI SDK
+
+`withVerification` wraps an existing `tool({...})`. It keeps the description, schema, approval settings, and so on, and the model receives `{ outcome, reason, message, result }`:
 
 ```ts
 import { tool } from "ai";
+import { withVerification } from "verified-tool/ai-sdk";
 
-export const chargeCardTool = tool({
-  description: "Charge the customer's card for an order",
-  inputSchema: z.object({ orderId: z.string(), amountCents: z.number().int() }),
-  execute: async (args) => describeOutcome(await chargeCard(args), "charge_card"),
-});
+export const chargeCard = withVerification(
+  tool({
+    description: "Charge the customer's card for an order",
+    inputSchema: z.object({ orderId: z.string(), amountCents: z.number().int() }),
+    execute: (input, { abortSignal }) => stripe.paymentIntents.create(/* … */),
+  }),
+  { name: "charge_card", effectKey: (input) => `charge:${input.orderId}`, downstreamIdempotent: true, store }
+);
 ```
 
-The same pattern works in any framework where a tool is an async function returning a string: the OpenAI Agents SDK, LangGraph.js, Mastra, or a hand-rolled loop on the Claude API.
+[`test/ai-sdk.test.ts`](test/ai-sdk.test.ts) runs this inside a real `generateText` loop. The model re-sends the charge after a lost response, as the models in LangGraph #8464 did. A plain tool charges twice; the wrapped one charges once and tells the model not to repeat it.
+
+## MCP: protect any server without changing it
+
+`verified-tool-mcp` sits between an MCP client (Claude Desktop, Claude Code, Cursor, your agent) and any MCP server, and protects the server's write tools. The server doesn't need to change:
+
+```json
+{
+  "mcpServers": {
+    "tickets": {
+      "command": "npx",
+      "args": ["-y", "-p", "verified-tool", "-p", "@modelcontextprotocol/sdk",
+               "verified-tool-mcp", "--config", "/path/to/policy.json",
+               "--", "node", "/path/to/your-mcp-server.js"]
+    }
+  }
+}
+```
+
+With no config, it reads each tool's MCP annotations:
+
+| Tool annotation | What the proxy does |
+|---|---|
+| `readOnlyHint: true` | Passes it straight through. |
+| `idempotentHint: true` | Retries once after a timeout, since repeating is harmless. |
+| anything else (a write) | Runs an identical call once per session. After a timeout or error, identical re-sends are blocked, and the agent is told *"It is not known whether create_issue took effect. Do not retry it…"* A call with different arguments is a new effect. |
+
+A policy file adds recovery for specific tools. This one tells the proxy to write a hidden marker into the issue body and, after a timeout, look for it with the server's own `list_issues` tool:
+
+```json
+{
+  "timeoutMs": 30000,
+  "tools": {
+    "create_issue": {
+      "effectKey": ["repo", "title"],
+      "marker": "body",
+      "reconcile": { "tool": "list_issues", "args": { "repo": "{repo}", "state": "open" } }
+    },
+    "post_comment": { "errorResults": "failed" },
+    "get_status": "passthrough"
+  }
+}
+```
+
+[`test/mcp.test.ts`](test/mcp.test.ts) covers each case against a fake GitHub-style MCP server, including one test that runs the actual CLI over stdio against a real server process. To embed the proxy in your own code instead, use `createVerifiedMcpProxy(upstreamClient, options)` from `verified-tool/mcp`.
 
 ## Outcomes
 
@@ -219,8 +264,8 @@ await resolveEffect(store, "charge:o988", "failed");                     // clea
 ## Development
 
 ```bash
-npm test            # unit tests; the Postgres/Redis tests skip without a database
-npm run test:db     # all 62, against real Postgres and Redis (docker compose up -d first)
+npm test            # unit, AI SDK, MCP and crash tests; the Postgres/Redis tests skip without a database
+npm run test:db     # all 84, against real Postgres and Redis (docker compose up -d first)
 npm run typecheck
 npm run build
 ```
