@@ -25,7 +25,9 @@ class LostClaim extends Error {}
  * The rule it enforces: after the request may have reached the outside world,
  * the only way to learn more is to read the outside world (verify /
  * reconcile). Re-executing is allowed only when an error proves the request
- * never took effect, or reconcile proves it didn't.
+ * never took effect, when the downstream dedupes by key, or when reconcile
+ * finds nothing after the request can no longer be in flight. "Not found"
+ * any sooner isn't proof: the request may still commit late.
  */
 export function defineTool<TArgs, TResult>(
   fn: (args: TArgs, ctx: ToolContext<TArgs>) => Promise<TResult>,
@@ -41,6 +43,7 @@ export function defineTool<TArgs, TResult>(
     reconcile,
     classifyError,
     downstreamIdempotent = false,
+    maxInFlightMs,
     authorize,
     maxExecutions = 3,
     poll = {},
@@ -84,12 +87,45 @@ export function defineTool<TArgs, TResult>(
       effectKey: key,
     });
 
+    // Every store write this call makes goes through one queue, so a heartbeat
+    // renewal still in flight can't land after (and undo) the final settle.
+    let queue: Promise<unknown> = Promise.resolve();
+    const serial = <T>(op: () => Promise<T>): Promise<T> => {
+      const next = queue.then(op);
+      queue = next.catch(() => {});
+      return next;
+    };
+
+    let lost = false;
+    const markLost = () => {
+      if (!lost) emit({ type: "lost_claim", effectKey: key! });
+      lost = true;
+    };
+
     /** Extends our lease. If someone else took the claim over, stop here. */
     async function renew() {
-      if (key && !(await store.replace(key, owner, record("claimed")))) {
-        emit({ type: "lost_claim", effectKey: key });
-        throw new LostClaim();
-      }
+      if (!key) return;
+      await serial(async () => {
+        if (!lost && !(await store.replace(key, owner, record("claimed")))) markLost();
+      });
+      if (lost) throw new LostClaim();
+    }
+
+    // Keeps the lease alive while we're inside a long call or waiting, so a
+    // slow tool isn't mistaken for a crashed one and run again.
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    function startHeartbeat() {
+      if (!key || heartbeat) return;
+      heartbeat = setInterval(() => {
+        serial(async () => {
+          if (heartbeat && !lost && !(await store.replace(key, owner, record("claimed")))) markLost();
+        }).catch(() => {}); // a failed renewal is retried on the next beat
+      }, Math.max(10, Math.floor(leaseMs / 3)));
+      (heartbeat as { unref?: () => void }).unref?.();
+    }
+    function stopHeartbeat() {
+      clearInterval(heartbeat);
+      heartbeat = undefined;
     }
 
     async function finish(
@@ -98,16 +134,19 @@ export function defineTool<TArgs, TResult>(
       result?: TResult,
       escalate = true
     ): Promise<ToolCallResult<TResult>> {
+      stopHeartbeat();
       // Only the owner may settle; a stale run that lost its claim writes nothing.
       if (key) {
-        if (outcome === "verified") {
-          await store.replace(key, owner, record("settled", { settledAt: Date.now(), result }));
-        } else if (outcome === "failed") {
-          await store.release(key, owner);
-        } else {
-          // Keep the effect blocked until reconcile or a person settles it.
-          await store.replace(key, owner, record("unresolved"));
-        }
+        await serial(async () => {
+          if (outcome === "verified") {
+            await store.replace(key, owner, record("settled", { settledAt: Date.now(), result }));
+          } else if (outcome === "failed") {
+            await store.release(key, owner);
+          } else {
+            // Keep the effect blocked until reconcile or a person settles it.
+            await store.replace(key, owner, record("unresolved"));
+          }
+        });
       }
 
       let escalated = false;
@@ -151,17 +190,33 @@ export function defineTool<TArgs, TResult>(
       return last;
     }
 
-    /** After a lost/unreadable response: a final result, or "retry" if reconcile proved nothing happened. */
-    async function resolveAmbiguity(escalate = true): Promise<ToolCallResult<TResult> | "retry"> {
-      const rec = reconcile
-        ? await pollUntilKnown(() => reconcile(ctx()), "reconcile")
-        : ({ outcome: "unknown" } as ReconcileResult<TResult>);
+    const runReconcile = (): Promise<ReconcileResult<TResult>> =>
+      reconcile ? pollUntilKnown(() => reconcile(ctx()), "reconcile") : Promise.resolve({ outcome: "unknown" });
+
+    /**
+     * After a lost/unreadable response, or on finding a claim a previous run
+     * left behind: a final result, or "retry" when executing (again) is safe.
+     * `sentAt` is the latest moment the earlier request could have been sent.
+     */
+    async function resolveAmbiguity(sentAt: number, escalate = true): Promise<ToolCallResult<TResult> | "retry"> {
+      let rec = await runReconcile();
+      if (rec.outcome === "failed" && !downstreamIdempotent && maxInFlightMs !== undefined) {
+        // "Not found" only proves absence once the request can no longer commit.
+        const waitMs = sentAt + maxInFlightMs - Date.now();
+        if (waitMs > 0) {
+          emit({ type: "await_in_flight", waitMs });
+          await sleep(waitMs);
+          if (lost) throw new LostClaim();
+          rec = await runReconcile();
+        }
+      }
       if (rec.outcome === "verified") return finish("verified", "reconciled", rec.result);
-      if (rec.outcome === "failed") return "retry";
+      // The provider dedupes by key, so re-sending can't create a second effect even if the first commits late.
       if (downstreamIdempotent) {
-        unprovenRetry = true;
+        if (rec.outcome !== "failed") unprovenRetry = true;
         return "retry";
       }
+      if (rec.outcome === "failed" && maxInFlightMs !== undefined) return "retry";
       return finish("unknown", "ambiguous", undefined, escalate);
     }
 
@@ -175,9 +230,12 @@ export function defineTool<TArgs, TResult>(
       }
     }
 
+    let sentAt = 0;
+
     try {
       if (key) {
         const existing = await store.claim(key, record("claimed"));
+        if (!existing) startHeartbeat();
         if (existing) {
           if (existing.state === "settled") {
             emit({ type: "cached", effectKey: key });
@@ -202,9 +260,12 @@ export function defineTool<TArgs, TResult>(
             emit({ type: "in_flight", effectKey: key });
             return inFlight();
           }
+          startHeartbeat();
           emit({ type: existing.state === "unresolved" ? "unresolved" : "stale_claim", effectKey: key });
+          // The previous holder renewed right up to sending (and while waiting), so
+          // its last renewal is the latest its request could have gone out.
           // An unresolved effect was already escalated once; don't page again for the same thing.
-          const recovered = await resolveAmbiguity(existing.state !== "unresolved");
+          const recovered = await resolveAmbiguity(existing.claimedAt, existing.state !== "unresolved");
           if (recovered !== "retry") return recovered;
         }
       }
@@ -229,22 +290,27 @@ export function defineTool<TArgs, TResult>(
         emit({ type: "execute", execution: executions });
 
         let raw: TResult;
+        sentAt = Date.now();
         try {
           raw = await fn(args, ctx());
         } catch (error) {
+          if (lost) throw new LostClaim();
           const errorClass = classify(error);
           emit({ type: "error", execution: executions, errorClass, error });
           if (errorClass === "not_executed") {
             if (executions < maxExecutions) await sleep(pollDelayMs);
             continue;
           }
-          const resolved = await resolveAmbiguity();
+          const resolved = await resolveAmbiguity(sentAt);
           if (resolved === "retry") {
             if (executions < maxExecutions) await sleep(pollDelayMs);
             continue;
           }
           return resolved;
         }
+
+        // Someone took the effect over while we were inside a call longer than the lease.
+        if (lost) throw new LostClaim();
 
         let result = raw;
         if (schema) {
@@ -253,7 +319,7 @@ export function defineTool<TArgs, TResult>(
           } catch (error) {
             // The call went through; we just can't read what came back.
             emit({ type: "schema_invalid", execution: executions, error });
-            const resolved = await resolveAmbiguity();
+            const resolved = await resolveAmbiguity(sentAt);
             if (resolved === "retry") continue;
             return resolved;
           }
@@ -275,6 +341,8 @@ export function defineTool<TArgs, TResult>(
     } catch (error) {
       if (error instanceof LostClaim) return inFlight();
       throw error;
+    } finally {
+      stopHeartbeat();
     }
   };
 }

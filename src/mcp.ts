@@ -38,6 +38,8 @@ export interface ProtectPolicy {
   errorResults?: "ambiguous" | "failed";
   /** Override the tool's idempotentHint annotation. */
   idempotent?: boolean;
+  /** How long a request to this tool can stay in flight; see DefineToolOptions.maxInFlightMs. Unset: "not found" is never trusted. */
+  maxInFlightMs?: number;
 }
 
 export type ToolPolicy = "passthrough" | ProtectPolicy;
@@ -164,6 +166,7 @@ export function createVerifiedMcpProxy(upstream: Client, options: VerifiedMcpPro
               }
             : undefined,
         downstreamIdempotent: idempotent,
+        maxInFlightMs: policy.maxInFlightMs,
         // The agent decides whether to try again after a real failure; only retry here when repeating is harmless.
         maxExecutions: idempotent ? 2 : 1,
         poll: { attempts: 3, delayMs: 300 },

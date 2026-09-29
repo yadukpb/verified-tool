@@ -42,16 +42,22 @@ console.log("\n2) verified-tool: effect key written into the issue body, reconci
   console.log(`   agent asks again for inc-42: ${again.reason}, executions: ${again.executions}`);
 }
 
-console.log("\n3) Same, but reconcile uses the search API (index lags a few seconds)");
+console.log("\n3) Reconcile using the search API instead (its index lags a few seconds)");
+const searchReconcile = (gh: FakeGitHub) => async ({ effectKey }: { effectKey?: string }) => {
+  const hits = await gh.search(markerFor(effectKey!));
+  return hits.length ? { outcome: "verified" as const, result: hits[0] } : { outcome: "failed" as const };
+};
 {
   const gh = new FakeGitHub(5_000);
   gh.faults = ["lost_response"];
-  await makeIssueTool(gh, {
-    reconcile: async ({ effectKey }) => {
-      const hits = await gh.search(markerFor(effectKey!));
-      return hits.length ? { outcome: "verified", result: hits[0] } : { outcome: "failed" };
-    },
-  })(incident);
-  console.log(`   issues titled "Checkout 500s": ${gh.count(incident.title)}   <- search said "not found" too early`);
-  console.log(`   reconcile must read a source that sees its own writes; an empty search result isn't proof\n`);
+  const r = await makeIssueTool(gh, { reconcile: searchReconcile(gh) })(incident);
+  console.log(`   default: search finds nothing, but "not found" right after a timeout isn't proof`);
+  console.log(`   result: ${r.outcome} (${r.reason}); issues: ${gh.count(incident.title)}   <- safe, a person confirms`);
+}
+{
+  const gh = new FakeGitHub(5_000);
+  gh.faults = ["lost_response"];
+  await makeIssueTool(gh, { reconcile: searchReconcile(gh), maxInFlightMs: 0 })(incident);
+  console.log(`   with maxInFlightMs: 0 ("nothing can still be in flight"): issues: ${gh.count(incident.title)}   <- duplicate`);
+  console.log(`   declaring a bound means trusting "not found"; that's only true if reconcile reads its own writes\n`);
 }

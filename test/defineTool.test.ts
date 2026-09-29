@@ -133,20 +133,103 @@ describe("recovering a claim left behind by a crashed run", () => {
     expect(stripe.countCharges("o988")).toBe(1);
   });
 
-  it("the effect never landed: executes once", async () => {
+  it("the effect never landed, and the request can no longer be in flight: executes once", async () => {
     const stripe = new FakeStripe();
-    const r = await makeChargeTool(stripe, { store: await staleClaim() })(order);
+    const r = await makeChargeTool(stripe, { store: await staleClaim(), maxInFlightMs: 5_000 })(order);
 
     expect(r).toMatchObject({ ok: true, reason: "verified", executions: 1 });
     expect(stripe.countCharges("o988")).toBe(1);
   });
 
+  it("not found, with no bound on in-flight time: unknown, not re-executed", async () => {
+    const stripe = new FakeStripe();
+    const r = await makeChargeTool(stripe, { store: await staleClaim() })(order);
+
+    expect(r).toMatchObject({ ok: false, outcome: "unknown", reason: "ambiguous", executions: 0 });
+    expect(stripe.countCharges("o988")).toBe(0);
+  });
+
   it("re-checks authorization before executing on recovery", async () => {
     const stripe = new FakeStripe();
-    const r = await makeChargeTool(stripe, { store: await staleClaim(), authorize: () => false })(order);
+    const r = await makeChargeTool(stripe, { store: await staleClaim(), maxInFlightMs: 5_000, authorize: () => false })(order);
 
     expect(r).toMatchObject({ ok: false, reason: "denied", executions: 0 });
     expect(stripe.countCharges("o988")).toBe(0);
+  });
+});
+
+describe("late commits (LIMBO, arXiv 2609.29095)", () => {
+  // The request times out, the check finds nothing, and then the request lands.
+  function lateCommitter(commitAfterMs: number) {
+    const effects: number[] = [];
+    const tool = (maxInFlightMs?: number) =>
+      defineTool(
+        async () => {
+          setTimeout(() => effects.push(Date.now()), commitAfterMs);
+          throw new Error("timeout (the request is still in flight)");
+        },
+        {
+          name: "t",
+          effectKey: () => "k",
+          maxInFlightMs,
+          reconcile: async () => (effects.length ? { outcome: "verified" } : { outcome: "failed" }),
+          poll: { attempts: 1 },
+        }
+      );
+    return { effects, tool };
+  }
+
+  it("without a bound, 'not found' is not proof: reports unknown and doesn't re-send", async () => {
+    const { effects, tool } = lateCommitter(100);
+    const r = await tool()({});
+    await new Promise((res) => setTimeout(res, 200));
+
+    expect(r).toMatchObject({ outcome: "unknown", reason: "ambiguous", executions: 1 });
+    expect(effects).toHaveLength(1);
+  });
+
+  it("with a bound, waits out the in-flight window, looks again, and finds the late commit", async () => {
+    const { effects, tool } = lateCommitter(100);
+    const r = await tool(250)({});
+
+    expect(r).toMatchObject({ ok: true, reason: "reconciled", executions: 1 });
+    expect(effects).toHaveLength(1);
+  });
+});
+
+describe("long-running tools (heartbeat)", () => {
+  it("a call longer than its lease keeps the claim: a second caller mid-run is told it's in flight", async () => {
+    let runs = 0;
+    const tool = defineTool(
+      async () => {
+        runs += 1;
+        await new Promise((r) => setTimeout(r, 300));
+        return {};
+      },
+      { name: "t", effectKey: () => "k", leaseMs: 60, maxInFlightMs: 0, reconcile: async () => ({ outcome: "failed" }) }
+    );
+
+    const first = tool({});
+    await new Promise((r) => setTimeout(r, 150)); // 2.5 leases in
+    const second = await tool({});
+
+    expect(second.reason).toBe("in_flight");
+    expect((await first).reason).toBe("trusted");
+    expect(runs).toBe(1);
+  });
+
+  it("the heartbeat stops at settle: the settled record isn't overwritten by a late renewal", async () => {
+    const store = createMemoryStore();
+    const tool = defineTool(
+      async () => {
+        await new Promise((r) => setTimeout(r, 100));
+        return { id: 1 };
+      },
+      { name: "t", store, effectKey: () => "k", leaseMs: 30 }
+    );
+    await tool({});
+    await new Promise((r) => setTimeout(r, 60));
+    expect((await store.get("k"))?.state).toBe("settled");
   });
 });
 
@@ -160,7 +243,7 @@ describe("races and ownership", () => {
         runs += 1;
         return {};
       },
-      { name: "t", store, effectKey: () => "k", reconcile: async () => ({ outcome: "failed" }) }
+      { name: "t", store, effectKey: () => "k", maxInFlightMs: 1_000, reconcile: async () => ({ outcome: "failed" }) }
     );
     const results = await Promise.all([tool({}), tool({}), tool({})]);
 

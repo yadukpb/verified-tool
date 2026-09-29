@@ -34,17 +34,22 @@ describe("creating an issue (no idempotency key; reconcile by a marker in the bo
     expect(gh.count("Checkout 500s")).toBe(1);
   });
 
-  it("reconciling against a lagging search index would duplicate it (why reconcile must read its own writes)", async () => {
-    const gh = new FakeGitHub(5_000);
-    gh.faults = ["lost_response"];
-    await makeIssueTool(gh, {
-      reconcile: async ({ effectKey }) => {
-        const hits = await gh.search(markerFor(effectKey!));
-        return hits.length ? { outcome: "verified", result: hits[0] } : { outcome: "failed" };
-      },
-    })(incident);
+  it("a lagging search index: safe by default, a duplicate once you declare an in-flight bound (why reconcile must read its own writes)", async () => {
+    const searchReconcile = (gh: FakeGitHub) => async ({ effectKey }: { effectKey?: string }) => {
+      const hits = await gh.search(markerFor(effectKey!));
+      return hits.length ? { outcome: "verified" as const, result: hits[0] } : { outcome: "failed" as const };
+    };
 
-    expect(gh.count("Checkout 500s")).toBe(2);
+    const safe = new FakeGitHub(5_000);
+    safe.faults = ["lost_response"];
+    const r = await makeIssueTool(safe, { reconcile: searchReconcile(safe) })(incident);
+    expect(r.outcome).toBe("unknown");
+    expect(safe.count("Checkout 500s")).toBe(1);
+
+    const trap = new FakeGitHub(5_000);
+    trap.faults = ["lost_response"];
+    await makeIssueTool(trap, { reconcile: searchReconcile(trap), maxInFlightMs: 0 })(incident);
+    expect(trap.count("Checkout 500s")).toBe(2);
   });
 
   it("the agent asking again for the same incident gets the existing issue", async () => {

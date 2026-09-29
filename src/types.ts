@@ -92,6 +92,7 @@ export type TraceEvent =
   | { type: "lost_claim"; tool: string; effectKey: string; timestamp: number }
   | { type: "hook_error"; tool: string; hook: "verify" | "reconcile" | "classifyError" | "onEscalate"; error: unknown; timestamp: number }
   | { type: "denied"; tool: string; timestamp: number }
+  | { type: "await_in_flight"; tool: string; waitMs: number; timestamp: number }
   | { type: "escalate"; tool: string; reason: Reason; timestamp: number }
   | { type: "settled"; tool: string; outcome: VerifyOutcome; reason: Reason; executions: number; timestamp: number };
 
@@ -113,11 +114,11 @@ export interface DefineToolOptions<TArgs, TResult> {
   effectKey?: (args: TArgs) => string;
   store?: EffectStore;
   /**
-   * How long a claim stays valid without renewal. The owner renews it before
-   * every execution and every verify/reconcile poll; a claim that goes
+   * How long a claim stays valid without renewal. While a call holds a claim
+   * it renews it on a heartbeat (every leaseMs / 3), including during a long
+   * execution, so a slow tool isn't mistaken for a crashed one. A claim left
    * unrenewed this long is presumed to belong to a crashed run and gets
-   * reconciled. Must be longer than one worst-case execution of the tool or
-   * one poll. Default 30s.
+   * reconciled. Default 30s.
    */
   leaseMs?: number;
   schema?: Parser<TResult>;
@@ -136,8 +137,28 @@ export interface DefineToolOptions<TArgs, TResult> {
    * look the effect up in the external system by effect key. This is what
    * makes a timed-out write safe: instead of re-executing, the wrapper asks
    * the real system whether the write landed.
+   *
+   * Return "verified" when you find it and "failed" when you don't. Not
+   * finding it only authorizes another execution when that's provably safe:
+   * with `downstreamIdempotent`, or once `maxInFlightMs` has passed since the
+   * request was sent. Otherwise the outcome is "unknown", because a request
+   * still in flight can commit after you looked. Read from a source that
+   * sees its own writes; a lagging search index isn't one.
    */
   reconcile?: (ctx: ToolContext<TArgs>) => Promise<ReconcileResult<TResult>>;
+  /**
+   * The longest a request can stay in flight and still take effect: your
+   * client timeout plus however long the provider may keep processing it.
+   * When reconcile finds nothing, the wrapper waits until this much time has
+   * passed since the request was sent, looks once more, and only then treats
+   * the effect as absent and executes again.
+   *
+   * Leave it unset if you can't bound it. Then "not found" after an
+   * ambiguous error is reported as unknown, never retried. That's the safe
+   * reading of the LIMBO result that no verification-only policy is
+   * exactly-once under late commits without such a bound (arXiv 2609.29095).
+   */
+  maxInFlightMs?: number;
   /**
    * The system you call deduplicates repeated requests by `ctx.effectKey`
    * (Stripe's Idempotency-Key; an MCP tool annotated `idempotentHint: true`).

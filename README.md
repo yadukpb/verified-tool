@@ -62,7 +62,16 @@ model tries again anyway: unknown, executions: 0          ← no second email
 next call: cached, executions: 0
 ```
 
-The second row has a trap, which `npm run demo:issue` shows. If `reconcile()` uses a search API, it can return "not found" for an issue created a second ago, because search indexes lag. The wrapper then treats absence as proven and creates a duplicate. List the repo directly, or query your own database. An empty result from an eventually consistent index is not proof.
+### "Not found" is not proof
+
+After a timeout, checking and finding nothing doesn't mean the request failed. It may still be in flight and commit a second later. [LIMBO](https://arxiv.org/abs/2609.29095) (September 2026) proves that no check-then-retry policy is exactly-once under late commits without a bound on in-flight time. It also measured frontier models duplicating 56% of writes in exactly this situation.
+
+So after an ambiguous error, the wrapper re-executes only when that's provably safe:
+- **`downstreamIdempotent: true`**: the provider dedupes by key, so a late commit and a retry collapse into one effect.
+- **`maxInFlightMs`**: you know the longest a request can stay in flight. The wrapper waits out that window since the request was sent, looks once more, and only then treats "not found" as absent.
+- **Neither**: the outcome is `unknown`, the effect stays blocked, and a person is asked.
+
+`npm run demo:issue` shows the trap this avoids. A search index that lags returns "not found" for an issue created a second ago. By default that's reported as unknown (one issue). Declare `maxInFlightMs: 0` with that lookup, and you get a duplicate. Declaring a bound means trusting "not found", which is only true if `reconcile()` reads from a source that sees its own writes.
 
 ## How it decides what to do
 
@@ -75,8 +84,9 @@ call(args)
       ├─ returned      → verify() (polled while pending)   → verified | failed | unknown
       ├─ threw, "not_executed" (e.g. 429)  → safe to execute again (up to maxExecutions)
       └─ threw, "ambiguous" (e.g. timeout) → reconcile() → found it: verified
-                                                          → proved absent: execute again
-                                                          → can't tell: unknown, escalate
+                                                          → not found: execute again only if the provider
+                                                            dedupes by key, or maxInFlightMs has passed
+                                                          → otherwise: unknown, escalate
 ```
 
 Every error defaults to **ambiguous**. You opt specific errors into "safe to retry"; you never have to remember to opt them out.
@@ -222,7 +232,7 @@ Both are tested against real Postgres 16 and Redis 7, including a test where 8 s
 
 - For anything else, implement the four-method `EffectStore` interface: an atomic insert-if-absent, plus compare-and-swap replace/delete on the owner token.
 
-The owner renews its lease before every execution and every verify/reconcile poll. A claim left unrenewed for `leaseMs` (default 30s) is presumed to belong to a crashed run and gets reconciled. So `leaseMs` only has to outlast **one** execution of your tool or one poll, not the whole call.
+While a call holds a claim, it renews the lease on a heartbeat (every `leaseMs / 3`), including during a long execution. A 10-minute tool isn't mistaken for a crashed one. That's the failure in [langgraph#7417](https://github.com/langchain-ai/langgraph/issues/7417), where a long tool call is silently dispatched again while the original is still running. A claim left unrenewed for `leaseMs` (default 30s) is presumed to belong to a crashed run and gets reconciled.
 
 ### Settling from outside the call
 
@@ -239,8 +249,8 @@ await resolveEffect(store, "charge:o988", "failed");                     // clea
 - **It doesn't write your `verify()` or `reconcile()`.** They're specific to each tool. Some systems (fire-and-forget webhooks, legacy RPC with no read API) give you no way to check. Then the honest answer is `unknown`, and the library escalates rather than guessing.
 - **It can't make a non-idempotent API idempotent.** The claim store stops *this wrapper* from re-executing. If the downstream doesn't honor an idempotency key, a request that was in flight when a process died can still have landed. That's exactly why recovery reconciles before acting.
 - **It isn't durable execution.** It doesn't resume your agent's workflow after a crash. It makes each side effect safe to call again. Use [Temporal](https://temporal.io) or [Restate](https://restate.dev) for durable workflows. The two approaches compose.
-- **It needs an honest `reconcile()`.** Returning `failed` from reconcile triggers another execution, so it must mean "proven absent", read from a source that sees its own writes. An eventually consistent search index (Stripe's `charges.search`, for one) can miss a charge made a second ago. Return `unknown` if the lookup might be lagging.
-- **A single execution longer than `leaseMs` looks like a crash.** Another caller can then take over and reconcile while the first run is still inside your function. Size the lease above your tool's worst-case latency.
+- **`maxInFlightMs` is a promise you make.** Set it only if you know the bound and `reconcile()` reads its own writes. An eventually consistent search index (Stripe's `charges.search`, for one) can miss a charge made a second ago. Without the option, "not found" is never trusted.
+- **A frozen process looks like a crashed one.** The heartbeat runs on the event loop. If the process stops scheduling timers for longer than `leaseMs` (a blocking synchronous computation, a stopped VM), another instance may take over.
 - **It doesn't cap how many times a run calls a tool.** Loop and budget limits are a separate concern.
 
 ## Prior art
@@ -257,6 +267,7 @@ await resolveEffect(store, "charge:o988", "failed");                     // clea
 
 ## Background reading
 
+- [Where Does Exactly-Once Live? Model, Harness, and Tool-Contract Effects on Duplicate Side Effects in LLM Agents](https://arxiv.org/abs/2609.29095) (arXiv 2609.29095, LIMBO): the tool contract explains 81% of duplicates; idempotency keys cut them from 28% to 4%.
 - [Characterizing False Success in LLM Agents](https://arxiv.org/abs/2606.09863) (arXiv 2606.09863)
 - [Verified Tool Calls Improve LLM Agent Reliability Under Non-Atomic Failures](https://arxiv.org/abs/2608.02645) (arXiv 2608.02645)
 - [langchain-ai/langgraph#8464](https://github.com/langchain-ai/langgraph/issues/8464): the discussion this design follows
