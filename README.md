@@ -155,9 +155,11 @@ export const chargeCard = withVerification(
 
 [`test/ai-sdk.test.ts`](test/ai-sdk.test.ts) runs this inside a real `generateText` loop. The model re-sends the charge after a lost response, as the models in LangGraph #8464 did. A plain tool charges twice; the wrapped one charges once and tells the model not to repeat it.
 
-## MCP: protect any server without changing it
+## MCP: an idempotency gateway for any server
 
-`verified-tool-mcp` sits between an MCP client (Claude Desktop, Claude Code, Cursor, your agent) and any MCP server, and protects the server's write tools. The server doesn't need to change:
+[LIMBO](https://arxiv.org/abs/2609.29095) found that the tool's contract, not the model or the agent framework, explains most duplicate side effects: 81% of the variance when the agent can't read back what happened. Offering an idempotency key on every write cut duplicates from 28% to 4%, because agents use keys when they exist. Most MCP servers don't offer one.
+
+`verified-tool-mcp` sits between an MCP client (Claude Desktop, Claude Code, Cursor, your agent) and any MCP server, and gives the server's write tools that contract. The server doesn't need to change:
 
 ```json
 {
@@ -172,19 +174,23 @@ export const chargeCard = withVerification(
 }
 ```
 
-With no config, it reads each tool's MCP annotations:
+What it does, with no configuration:
 
-| Tool annotation | What the proxy does |
+- **Adds an `idempotency_key` argument to every write tool it lists.** When the agent passes one, a retry with the same key runs once, even if the agent reworded the other arguments. Reusing a key for a *different* request is refused, as Stripe does. The key is stripped before forwarding, unless the server's schema already defines it, in which case it's passed through.
+- **Never abandons a request in flight.** The agent gets an answer within `respondWithinMs` (default 25s). If the server is still working, the agent is told *"create_issue is still running. It has not been sent twice and will not be. Call create_issue again later with the same idempotency_key…"*. The gateway keeps waiting (up to `timeoutMs`, default 10 minutes), records the real outcome, and returns it on the next call. That covers the case LIMBO shows checking can't: a request that's slow rather than lost.
+- **Follows each tool's MCP annotations:**
+
+| Tool annotation | What the gateway does |
 |---|---|
-| `readOnlyHint: true` | Passes it straight through. |
+| `readOnlyHint: true` | Passes it straight through, with no key added. |
 | `idempotentHint: true` | Retries once after a timeout, since repeating is harmless. |
-| anything else (a write) | Runs an identical call once per session. After a timeout or error, identical re-sends are blocked, and the agent is told *"It is not known whether create_issue took effect. Do not retry it…"* A call with different arguments is a new effect. |
+| anything else (a write) | Runs an identical call once per session. After a timeout or error, re-sends are blocked, and the agent is told *"It is not known whether create_issue took effect. Do not retry it…"* |
 
 A policy file adds recovery for specific tools. This one tells the proxy to write a hidden marker into the issue body and, after a timeout, look for it with the server's own `list_issues` tool:
 
 ```json
 {
-  "timeoutMs": 30000,
+  "respondWithinMs": 20000,
   "tools": {
     "create_issue": {
       "effectKey": ["repo", "title"],
@@ -197,7 +203,9 @@ A policy file adds recovery for specific tools. This one tells the proxy to writ
 }
 ```
 
-[`test/mcp.test.ts`](test/mcp.test.ts) covers each case against a fake GitHub-style MCP server, including one test that runs the actual CLI over stdio against a real server process. To embed the proxy in your own code instead, use `createVerifiedMcpProxy(upstreamClient, options)` from `verified-tool/mcp`.
+What's left when the gateway itself crashes mid-request is the same late-commit problem as anywhere else. The next session finds the expired claim and reconciles it (with `reconcile` and `maxInFlightMs` if configured). Otherwise it reports unknown rather than re-sending.
+
+[`test/mcp.test.ts`](test/mcp.test.ts) covers each case against a fake GitHub-style MCP server. That includes a slow write that an agent with a plain client timeout duplicates, and one test that runs the actual CLI over stdio against a real server process. To embed the proxy in your own code instead, use `createVerifiedMcpProxy(upstreamClient, options)` from `verified-tool/mcp`.
 
 ## Outcomes
 

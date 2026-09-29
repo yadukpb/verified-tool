@@ -139,6 +139,39 @@ describe("MCP proxy", () => {
   });
 });
 
+describe("MCP proxy: requests still in flight", () => {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  it("baseline: an agent whose client times out on a slow write, then retries, creates it twice", async () => {
+    const gh = createFakeGitHubMcp();
+    const agent = await connect(gh.server);
+    gh.faults.push("slow");
+
+    await expect(agent.callTool({ name: "create_issue", arguments: issue }, undefined, { timeout: 100 })).rejects.toThrow(/timed out/i);
+    await agent.callTool({ name: "create_issue", arguments: issue });
+    await sleep(400); // the first request was still running on the server, and commits
+
+    expect(gh.issues).toHaveLength(2);
+  });
+
+  it("the gateway answers in time, keeps the request, blocks retries while it runs, then returns the real result", async () => {
+    const { gh, agent } = await setup({ respondWithinMs: 100, timeoutMs: 5_000 });
+    gh.faults.push("slow");
+    const call = () => agent.callTool({ name: "create_issue", arguments: { ...issue, idempotency_key: "inc-42" } });
+
+    const first = await call();
+    const retry = await call();
+    await sleep(400);
+    const later = await call();
+
+    expect(first.isError).toBeFalsy();
+    expect(text(first)).toMatch(/still running\. It has not been sent twice.*idempotency_key "inc-42"/);
+    expect(text(retry)).toMatch(/still running/);
+    expect(text(later)).toMatch(/already completed earlier.*Created issue #1/s);
+    expect(gh.issues).toHaveLength(1);
+  });
+});
+
 describe("MCP proxy: idempotency keys", () => {
   it("a retry with the same key after a timeout is blocked even when the agent rewords the arguments", async () => {
     const { gh, agent } = await setup();

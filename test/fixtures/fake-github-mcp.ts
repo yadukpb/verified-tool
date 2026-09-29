@@ -4,7 +4,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-export type Fault = "hang" | "reject";
+export type Fault = "hang" | "reject" | "slow";
+const SLOW_MS = 300;
 
 export function createFakeGitHubMcp() {
   const issues: { number: number; title: string; body: string; labels: string[] }[] = [];
@@ -22,6 +23,7 @@ export function createFakeGitHubMcp() {
     async ({ title, body }) => {
       const fault = faults.shift();
       if (fault === "reject") return { content: [{ type: "text", text: "422: title is too long" }], isError: true };
+      if (fault === "slow") await new Promise((r) => setTimeout(r, SLOW_MS)); // commits late, then answers
       const issue = { number: issues.length + 1, title, body, labels: [] };
       issues.push(issue);
       if (fault === "hang") await hang(); // created, but the response never arrives
@@ -75,7 +77,7 @@ export function createFakeGitHubMcp() {
   // Test control; configure the proxy to pass it through.
   server.registerTool(
     "_fault",
-    { inputSchema: { kind: z.enum(["hang", "reject"]) } },
+    { inputSchema: { kind: z.enum(["hang", "reject", "slow"]) } },
     async ({ kind }) => {
       faults.push(kind);
       return { content: [{ type: "text", text: "ok" }] };

@@ -53,8 +53,20 @@ export interface VerifiedMcpProxyOptions {
    * repeats instead of letting the agent send them again.
    */
   default?: "protect" | "passthrough";
-  /** Upstream call timeout; a timeout is treated as ambiguous. Default 60s. */
+  /**
+   * How long the gateway keeps waiting on an upstream call before giving up
+   * on it. A timeout is ambiguous: the call may still commit. Default 10 minutes.
+   */
   timeoutMs?: number;
+  /**
+   * How long the agent waits for an answer. If the upstream call is still
+   * running by then, the agent is told it's in progress and to call again
+   * later with the same key or arguments. The gateway keeps the request (it
+   * isn't abandoned or re-sent) and records its real outcome when it
+   * arrives, which the next call returns. Default 25s, under typical client
+   * timeouts.
+   */
+  respondWithinMs?: number;
   /** Default: in memory, i.e. for the lifetime of this proxy process (one client session over stdio). */
   store?: EffectStore;
   /** How the marker is written into the `marker` argument. Default "\n\n<!-- {marker} -->". */
@@ -121,7 +133,8 @@ const keyDescription = (param: string) =>
  */
 export function createVerifiedMcpProxy(upstream: Client, options: VerifiedMcpProxyOptions = {}): Server {
   const store = options.store ?? createMemoryStore();
-  const timeout = options.timeoutMs ?? 60_000;
+  const timeout = options.timeoutMs ?? 600_000;
+  const respondWithinMs = options.respondWithinMs ?? 25_000;
   const markerTemplate = options.markerTemplate ?? "\n\n<!-- {marker} -->";
   const markerFor = (key: string) => `verified-tool:${key}`;
   const keyParam = options.idempotencyKeyParam === undefined ? "idempotency_key" : options.idempotencyKeyParam;
@@ -217,8 +230,32 @@ export function createVerifiedMcpProxy(upstream: Client, options: VerifiedMcpPro
       if (keyParam && !nativeKey) delete callArgs[keyParam];
       if (agentKey) agentKeys.set(callArgs, agentKey);
 
-      const r: ToolCallResult<CallToolResult> = await tool(callArgs);
+      const stillRunning = () =>
+        note(
+          `${name} is still running. It has not been sent twice and will not be. ` +
+            `Call ${name} again later with the same ${agentKey ? `${keyParam} "${agentKey}"` : "arguments"} to get its result. ` +
+            `Don't tell the user it's done yet.`
+        );
+
+      // Answer the agent in time, but never abandon the upstream request: it
+      // keeps running, holds its claim, and records its real outcome.
+      const pending = tool(callArgs);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const slow = new Promise<"slow">((resolve) => {
+        timer = setTimeout(() => resolve("slow"), respondWithinMs);
+        (timer as { unref?: () => void }).unref?.();
+      });
+      const first = await Promise.race([pending, slow]);
+      clearTimeout(timer);
+      if (first === "slow") {
+        pending.catch(() => {}); // settles the store on its own; nobody is waiting on it here
+        return stillRunning();
+      }
+
+      const r: ToolCallResult<CallToolResult> = first;
       switch (r.reason) {
+        case "in_flight":
+          return stillRunning();
         case "verified":
         case "trusted":
           return clean(r.result);
