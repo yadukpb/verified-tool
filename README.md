@@ -5,6 +5,12 @@
 A small TypeScript wrapper for any agent tool that changes something outside your process. It is framework-agnostic and has no runtime dependencies. After a request may have reached the outside world, it learns more only by *reading* the outside world, never by blindly doing the action again.
 
 ```bash
+npm install verified-tool
+```
+
+To run the demos:
+
+```bash
 git clone https://github.com/yadukpb/verified-tool && cd verified-tool && npm install
 npm run demo          # payment: lost response → naive retry double-charges; this doesn't
 npm run demo:issue    # ticket: no idempotency key, found again by a marker in its body

@@ -2,6 +2,30 @@
   "name": "verified-tool",
   "version": "0.2.0",
   "description": "Stop AI agents from repeating side effects (double charges, duplicate tickets, duplicate emails) or claiming success they can't confirm. Reconcile-before-retry, crash-safe effect keys, three-state outcomes.",
+  "keywords": [
+    "ai-agent",
+    "llm",
+    "tool-calling",
+    "idempotency",
+    "exactly-once",
+    "side-effects",
+    "retry",
+    "reconcile",
+    "crash-recovery",
+    "langgraph",
+    "vercel-ai-sdk",
+    "mcp"
+  ],
+  "homepage": "https://github.com/yadukpb/verified-tool#readme",
+  "bugs": {
+    "url": "https://github.com/yadukpb/verified-tool/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yadukpb/verified-tool.git"
+  },
+  "license": "MIT",
+  "author": "yadukpb",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -18,34 +42,26 @@
   "files": [
     "dist"
   ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "build": "tsup src/index.ts src/file-store.ts --format esm --dts",
+    "build": "tsup src/index.ts src/file-store.ts --format esm --dts --clean",
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p . && tsc --noEmit --strict --module ESNext --moduleResolution Bundler --target ES2022 --skipLibCheck --types node examples/*.ts test/*.ts",
     "demo": "tsx examples/double-charge-demo.ts",
     "demo:crash": "tsx examples/crash-demo.ts",
     "demo:settlement": "tsx examples/settlement-demo.ts",
     "demo:issue": "tsx examples/issue-demo.ts",
-    "demo:email": "tsx examples/email-demo.ts"
+    "demo:email": "tsx examples/email-demo.ts",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
-  "keywords": [
-    "ai-agent",
-    "llm",
-    "tool-calling",
-    "verification",
-    "idempotency",
-    "reliability"
-  ],
-  "license": "MIT",
-  "author": "yadukpb",
   "devDependencies": {
     "@types/node": "^22.20.4",
     "tsup": "^8.3.5",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "^5.0.2"
-  },
-  "engines": {
-    "node": ">=20"
   }
 }
