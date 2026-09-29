@@ -27,9 +27,11 @@ export function createMemoryStore(): EffectStore {
 }
 
 /**
- * For an operator settling an effect that ended "unknown", once they've
- * checked by hand. "verified" makes later calls return it as cached;
- * "failed" clears it so a later call may execute.
+ * Settles an effect from outside the tool call: a person who checked by
+ * hand, or a webhook handler receiving the provider's delivered/bounced
+ * event. "verified" makes later calls return it as cached; "failed" clears
+ * it so a later call may execute. Takes ownership, so a call still running
+ * for this key can't overwrite the answer.
  */
 export async function resolveEffect(
   store: EffectStore,
@@ -38,12 +40,12 @@ export async function resolveEffect(
   result?: unknown
 ): Promise<boolean> {
   const current = await store.get(key);
-  if (!current) return false;
+  if (!current || current.state === "settled") return false;
   if (outcome === "failed") return store.release(key, current.owner);
   const now = Date.now();
   return store.replace(key, current.owner, {
     state: "settled",
-    owner: current.owner,
+    owner: `resolved:${globalThis.crypto.randomUUID()}`,
     claimedAt: now,
     settledAt: now,
     result,

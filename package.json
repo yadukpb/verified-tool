@@ -1,7 +1,7 @@
 {
   "name": "verified-tool",
   "version": "0.2.0",
-  "description": "Stop AI agents from double-charging, double-sending, or claiming success they can't confirm. Reconcile-before-retry, crash-safe effect keys, and three-state outcomes for agent tool calls.",
+  "description": "Stop AI agents from repeating side effects (double charges, duplicate tickets, duplicate emails) or claiming success they can't confirm. Reconcile-before-retry, crash-safe effect keys, three-state outcomes.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -24,7 +24,9 @@
     "typecheck": "tsc --noEmit -p . && tsc --noEmit --strict --module ESNext --moduleResolution Bundler --target ES2022 --skipLibCheck --types node examples/*.ts test/*.ts",
     "demo": "tsx examples/double-charge-demo.ts",
     "demo:crash": "tsx examples/crash-demo.ts",
-    "demo:settlement": "tsx examples/settlement-demo.ts"
+    "demo:settlement": "tsx examples/settlement-demo.ts",
+    "demo:issue": "tsx examples/issue-demo.ts",
+    "demo:email": "tsx examples/email-demo.ts"
   },
   "keywords": [
     "ai-agent",

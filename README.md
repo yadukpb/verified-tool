@@ -1,12 +1,14 @@
 # verified-tool
 
-**Stop your AI agent from double-charging, double-sending, or claiming success it can't confirm.**
+**Stop your AI agent from repeating side effects (a second charge, a duplicate ticket, the same email twice) or claiming success it can't confirm.**
 
-A small TypeScript wrapper for side-effecting agent tools (payments, emails, tickets, writes). It is framework-agnostic and has no runtime dependencies. After a request may have reached the outside world, it learns more only by *reading* the outside world, never by blindly doing the action again.
+A small TypeScript wrapper for any agent tool that changes something outside your process. It is framework-agnostic and has no runtime dependencies. After a request may have reached the outside world, it learns more only by *reading* the outside world, never by blindly doing the action again.
 
 ```bash
 git clone https://github.com/yadukpb/verified-tool && cd verified-tool && npm install
-npm run demo          # lost response → naive retry double-charges; this doesn't
+npm run demo          # payment: lost response → naive retry double-charges; this doesn't
+npm run demo:issue    # ticket: no idempotency key, found again by a marker in its body
+npm run demo:email    # email: nothing to check, blocked until the delivery webhook settles it
 npm run demo:crash    # kill -9 right after the charge, restart, recover with no second charge
 ```
 
@@ -30,6 +32,31 @@ expected: 1 charge    actual: 2 charges    agent's report: success
 The reporter measured this across 5 runs per setup. The default retry policy double-charged 5/5 times. Turning off retries and letting the model handle the error also double-charged 5/5, because **the model re-sent the call itself**, checking first only once in 30 fault runs. Only an idempotency key derived from the business object (not the model's `tool_call_id`, which changes when the model re-plans) prevented it.
 
 A timeout is not a failure. It means *we don't know*. The same thread identifies the rest of what a fix needs: a durable claim before executing, a `reconcile()` read of the external system before any retry, and a fresh authorization check before re-executing after recovery. This library implements those.
+
+Payments are the example because the evidence is a real double charge, but nothing here is Stripe-specific. The same thread's other reproduction was a GitHub issue created twice through MCP.
+
+## Three kinds of side effect
+
+What you can do after a lost response depends on what the other system lets you ask. There are three cases, and each has a runnable example:
+
+| The system… | Examples | How you find out what happened | Example |
+|---|---|---|---|
+| **accepts an idempotency key and lets you read by it** | Stripe, Adyen, many modern payment and banking APIs | Forward `ctx.effectKey` as the idempotency key. `verify()` reads the object and `reconcile()` looks it up. | [`charge-tool.ts`](examples/charge-tool.ts) |
+| **has no idempotency key, but lets you list what exists** | GitHub/Jira issues, Slack messages, calendar events, your own database | Write the effect key *into* what you create (a hidden marker, a unique column). `reconcile()` lists recent items and looks for it. | [`issue-tool.ts`](examples/issue-tool.ts) |
+| **can't be asked at all, only reports back later** | Email, SMS, push, outbound webhooks | Don't write a `reconcile()`; there's no honest one. A lost response ends `unknown` and stays blocked. The provider's webhook calls `resolveEffect()` when the delivered/bounced event arrives. | [`email-tool.ts`](examples/email-tool.ts) |
+
+The third row is the one most wrappers get wrong. They either retry (duplicate email) or report success (the agent says "sent" when it doesn't know). Here, the model is told the result is pending, a person is paged, and the webhook settles it:
+
+```
+send_email → POST /mail/send timed out
+result: unknown (ambiguous), escalated
+model sees: "It is not known whether send_email took effect. Do not retry it…"
+model tries again anyway: unknown, executions: 0          ← no second email
+...provider webhook arrives: delivered → resolveEffect(store, key, "verified")
+next call: cached, executions: 0
+```
+
+The second row has a trap, which `npm run demo:issue` shows. If `reconcile()` uses a search API, it can return "not found" for an issue created a second ago, because search indexes lag. The wrapper then treats absence as proven and creates a duplicate. List the repo directly, or query your own database. An empty result from an eventually consistent index is not proof.
 
 ## How it decides what to do
 
@@ -131,9 +158,9 @@ The effect store holds claims and settled results by effect key. Each claim carr
 
 The owner renews its lease before every execution and every verify/reconcile poll. A claim left unrenewed for `leaseMs` (default 30s) is presumed to belong to a crashed run and gets reconciled. So `leaseMs` only has to outlast **one** execution of your tool or one poll, not the whole call.
 
-### Settling by hand
+### Settling from outside the call
 
-After an `unknown` outcome escalates, the person who checks it records the answer:
+After an `unknown` outcome, whoever finds out records the answer. That can be a person who checked by hand, or a webhook handler (see [`settleFromWebhooks`](examples/email-tool.ts)). `resolveEffect()` takes ownership of the record, so a call still running for that key can't overwrite it.
 
 ```ts
 import { resolveEffect } from "verified-tool";
@@ -171,7 +198,7 @@ await resolveEffect(store, "charge:o988", "failed");                     // clea
 ## Development
 
 ```bash
-npm test            # 28 tests: lost responses, SIGKILL crash recovery, claim races, lease renewal, throwing hooks
+npm test            # 37 tests: payments, tickets and emails under lost responses; SIGKILL crash recovery; claim races; lease renewal; throwing hooks
 npm run typecheck
 npm run build
 ```
