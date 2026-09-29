@@ -3,8 +3,8 @@
 // there isn't one. A lost response ends as "unknown", the effect stays
 // blocked (no second email), and the provider's webhook settles it later.
 // The same pattern fits SMS, push notifications, and outbound webhooks.
-import { defineTool, resolveEffect, type DefineToolOptions, type EffectStore } from "../src/index.js";
-import type { FakeMailer } from "./fake-mailer.js";
+import { defineTool, settleOnEvent, type DefineToolOptions, type EffectStore } from "../src/index.js";
+import type { FakeMailer, WebhookEvent } from "./fake-mailer.js";
 
 export interface EmailArgs {
   refId: string;
@@ -33,11 +33,10 @@ export function makeEmailTool(
 
 /** Your webhook endpoint: turns the provider's delivery events into settled effects. */
 export function settleFromWebhooks(mailer: FakeMailer, store: EffectStore) {
-  mailer.onWebhook((event) => {
-    const key = event.metadata.effectKey;
-    if (!key) return;
-    void resolveEffect(store, key, event.type === "delivered" ? "verified" : "failed", {
-      messageId: event.messageId,
-    });
+  const settle = settleOnEvent<WebhookEvent>(store, {
+    effectKey: (e) => e.metadata.effectKey,
+    outcome: (e) => (e.type === "delivered" ? "verified" : "failed"),
+    result: (e) => ({ messageId: e.messageId }),
   });
+  mailer.onWebhook((event) => void settle(event));
 }

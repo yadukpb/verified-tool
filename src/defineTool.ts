@@ -40,6 +40,7 @@ export function defineTool<TArgs, TResult>(
     verify,
     reconcile,
     classifyError,
+    downstreamIdempotent = false,
     authorize,
     maxExecutions = 3,
     poll = {},
@@ -47,6 +48,10 @@ export function defineTool<TArgs, TResult>(
     onEscalate,
     trace,
   } = options;
+
+  if ((fn as { requiresEffectKey?: boolean }).requiresEffectKey && !effectKey) {
+    throw new Error(`Tool "${name}" uses markerRecipe, which needs an effectKey option`);
+  }
 
   const pollAttempts = Math.max(1, poll.attempts ?? 5);
   const pollDelayMs = poll.delayMs ?? 250;
@@ -59,6 +64,8 @@ export function defineTool<TArgs, TResult>(
     const key = effectKey?.(args);
     const owner = globalThis.crypto.randomUUID();
     let executions = 0;
+    // Set when we re-execute without proof the previous attempt didn't land.
+    let unprovenRetry = false;
     const ctx = (): ToolContext<TArgs> => ({ toolName: name, args, effectKey: key, execution: executions });
     const record = (state: EffectRecord["state"], extra: Partial<EffectRecord> = {}): EffectRecord => ({
       state,
@@ -151,6 +158,10 @@ export function defineTool<TArgs, TResult>(
         : ({ outcome: "unknown" } as ReconcileResult<TResult>);
       if (rec.outcome === "verified") return finish("verified", "reconciled", rec.result);
       if (rec.outcome === "failed") return "retry";
+      if (downstreamIdempotent) {
+        unprovenRetry = true;
+        return "retry";
+      }
       return finish("unknown", "ambiguous", undefined, escalate);
     }
 
@@ -228,7 +239,10 @@ export function defineTool<TArgs, TResult>(
             continue;
           }
           const resolved = await resolveAmbiguity();
-          if (resolved === "retry") continue;
+          if (resolved === "retry") {
+            if (executions < maxExecutions) await sleep(pollDelayMs);
+            continue;
+          }
           return resolved;
         }
 
@@ -257,7 +271,7 @@ export function defineTool<TArgs, TResult>(
         return finish("unknown", "ambiguous", latest);
       }
 
-      return finish("failed", "exhausted");
+      return unprovenRetry ? finish("unknown", "ambiguous") : finish("failed", "exhausted");
     } catch (error) {
       if (error instanceof LostClaim) return inFlight();
       throw error;

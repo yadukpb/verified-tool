@@ -1,4 +1,4 @@
-import { defineTool, type DefineToolOptions, type VerifyOutcome } from "../src/index.js";
+import { defineTool, statusCheck, type DefineToolOptions, type VerifyOutcome } from "../src/index.js";
 import { FakeStripe, RateLimitError, type ChargeStatus } from "./fake-stripe.js";
 
 export interface ChargeArgs {
@@ -27,10 +27,10 @@ export function makeChargeTool(
       name: "charge_card",
       effectKey: (args) => `charge:${args.orderId}`,
       classifyError: (error) => (error instanceof RateLimitError ? "not_executed" : "ambiguous"),
-      verify: async (result) => {
-        const charge = await stripe.retrieve(result.id);
-        return charge ? { outcome: toOutcome(charge.status), result: charge } : "unknown";
-      },
+      verify: statusCheck((r) => stripe.retrieve(r.id), (c) => c.status, {
+        verified: ["succeeded"],
+        failed: ["declined"],
+      }),
       // With real Stripe, prefer replaying the request with the same
       // Idempotency-Key (Stripe returns the original response) over
       // charges.search, which is eventually consistent.

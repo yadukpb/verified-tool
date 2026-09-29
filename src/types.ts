@@ -138,6 +138,15 @@ export interface DefineToolOptions<TArgs, TResult> {
    * the real system whether the write landed.
    */
   reconcile?: (ctx: ToolContext<TArgs>) => Promise<ReconcileResult<TResult>>;
+  /**
+   * The system you call deduplicates repeated requests by `ctx.effectKey`
+   * (Stripe's Idempotency-Key; an MCP tool annotated `idempotentHint: true`).
+   * Then re-executing after an ambiguous error is safe, so it's what happens
+   * when reconcile can't settle the question. Still counted against
+   * maxExecutions and still checked by authorize(). If every attempt stays
+   * ambiguous, the outcome is "unknown", never "failed".
+   */
+  downstreamIdempotent?: boolean;
   /** Defaults to treating every error as "ambiguous", which is the safe choice for write tools. */
   classifyError?: (error: unknown, ctx: ToolContext<TArgs>) => ErrorClass;
   /**
