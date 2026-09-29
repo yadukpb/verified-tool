@@ -64,6 +64,7 @@ export function defineTool<TArgs, TResult>(
       state,
       owner,
       claimedAt: Date.now(),
+      leaseMs,
       ...extra,
     });
 
@@ -179,7 +180,7 @@ export function defineTool<TArgs, TResult>(
               effectKey: key,
             };
           }
-          const expired = Date.now() - existing.claimedAt >= leaseMs;
+          const expired = Date.now() - existing.claimedAt >= (existing.leaseMs ?? leaseMs);
           if (existing.state === "claimed" && !expired) {
             emit({ type: "in_flight", effectKey: key });
             return inFlight();

@@ -195,6 +195,23 @@ describe("races and ownership", () => {
     expect(runs).toBe(1);
   });
 
+  it("expiry uses the lease the claim was written with, not the reader's own setting", async () => {
+    const store = createMemoryStore();
+    // written by an instance configured with a 60s lease, 1s ago
+    await store.claim("k", { state: "claimed", owner: "live", claimedAt: Date.now() - 1_000, leaseMs: 60_000 });
+    let runs = 0;
+    const shortLeaseInstance = defineTool(
+      async () => {
+        runs += 1;
+        return {};
+      },
+      { name: "t", store, effectKey: () => "k", leaseMs: 100, reconcile: async () => ({ outcome: "failed" }) }
+    );
+
+    expect((await shortLeaseInstance({})).reason).toBe("in_flight");
+    expect(runs).toBe(0);
+  });
+
   it("a run that lost its claim can't release or overwrite the new owner's", async () => {
     const store = createMemoryStore();
     await store.claim("k", { state: "claimed", owner: "new-owner", claimedAt: Date.now() });

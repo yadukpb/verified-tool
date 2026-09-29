@@ -160,7 +160,22 @@ The effect store holds claims and settled results by effect key. Each claim carr
 
 - `createMemoryStore()` is the default. It's fine for a single process, but it can't recover a crash.
 - `createFileStore(dir)` (from `verified-tool/file-store`, Node only) survives `kill -9` on one machine. It's what `npm run demo:crash` uses.
-- For multiple instances, implement the four-method `EffectStore` interface. In Postgres, `claim` is `INSERT … ON CONFLICT DO NOTHING`, and `replace`/`release` are `UPDATE`/`DELETE … WHERE owner = $expected`. In Redis, `claim` is `SET NX`, and the other two are a small compare-and-set Lua script.
+- `createPostgresStore(pool)` and `createRedisStore(eval)` are for multiple instances. Both take the client you already have; the package still has no dependencies.
+
+```ts
+import { createPostgresStore, createRedisStore } from "verified-tool";
+
+const pgStore = createPostgresStore(pool);           // any client with pg's query(text, params)
+await pgStore.migrate();                             // or copy the CREATE TABLE into your migrations
+
+const redisStore = createRedisStore((script, keys, args) =>
+  redis.eval(script, keys.length, ...keys, ...args)  // ioredis; node-redis and Upstash adapters are in the docs
+);
+```
+
+Both are tested against real Postgres 16 and Redis 7, including a test where 8 separate processes fire the same effect at the same instant (it happens once), and one where an instance is SIGKILLed mid-effect while 7 others race to recover it (one reconciles, none re-execute). Run them with `docker compose up -d && npm run test:db`.
+
+- For anything else, implement the four-method `EffectStore` interface: an atomic insert-if-absent, plus compare-and-swap replace/delete on the owner token.
 
 The owner renews its lease before every execution and every verify/reconcile poll. A claim left unrenewed for `leaseMs` (default 30s) is presumed to belong to a crashed run and gets reconciled. So `leaseMs` only has to outlast **one** execution of your tool or one poll, not the whole call.
 
@@ -204,7 +219,8 @@ await resolveEffect(store, "charge:o988", "failed");                     // clea
 ## Development
 
 ```bash
-npm test            # 37 tests: payments, tickets and emails under lost responses; SIGKILL crash recovery; claim races; lease renewal; throwing hooks
+npm test            # unit tests; the Postgres/Redis tests skip without a database
+npm run test:db     # all 62, against real Postgres and Redis (docker compose up -d first)
 npm run typecheck
 npm run build
 ```

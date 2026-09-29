@@ -37,6 +37,11 @@ export interface EffectRecord {
   owner: string;
   /** Last time the owner renewed its lease. */
   claimedAt: number;
+  /**
+   * The owner's lease length. Stored with the claim so every instance judges
+   * expiry the same way, even if they're configured with different leaseMs.
+   */
+  leaseMs?: number;
   settledAt?: number;
   result?: unknown;
 }

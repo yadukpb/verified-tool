@@ -1,0 +1,9 @@
+# Databases for the Postgres/Redis store tests: docker compose up -d && npm run test:db
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment: { POSTGRES_PASSWORD: vt, POSTGRES_DB: vt }
+    ports: ["55432:5432"]
+  redis:
+    image: redis:7-alpine
+    ports: ["56379:6379"]
