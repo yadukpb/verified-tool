@@ -1,0 +1,38 @@
+{
+  "name": "verified-tool",
+  "version": "0.1.0",
+  "description": "Stop your AI agent from believing a tool call succeeded when it didn't. A drop-in wrapper that verifies tool-call outcomes (verified/failed/unknown) instead of trusting the return value.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts",
+    "test": "vitest run",
+    "demo": "tsx examples/payment-demo.ts"
+  },
+  "keywords": [
+    "ai-agent",
+    "llm",
+    "tool-calling",
+    "verification",
+    "idempotency",
+    "reliability"
+  ],
+  "license": "MIT",
+  "author": "yadukpb",
+  "devDependencies": {
+    "tsup": "^8.3.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^5.0.2"
+  }
+}
